@@ -1,0 +1,949 @@
+"""
+bot.py - ไฟล์หลักของ Discord Shop Bot
+======================================
+บอทสำหรับขายรหัสเกมบน Discord
+รองรับภาษาไทยและอังกฤษ
+
+คำสั่งทั้งหมด:
+  ผู้ใช้ทั่วไป:
+    /balance   - ตรวจสอบยอดเงิน
+    /shop      - ดูรายการสินค้า
+    /buy       - ซื้อสินค้า
+    /history   - ดูประวัติธุรกรรม
+
+  Admin เท่านั้น:
+    /setup          - ตั้งค่าบอท (backend channel, wallet)
+    /create-product - สร้างสินค้าใหม่
+    /add-stock      - เพิ่มรหัสเกมเข้าสต็อก
+    /delete-product - ลบสินค้า
+    /add-point      - เพิ่มเงินให้ผู้ใช้
+    /deduct-point   - หักเงินจากผู้ใช้
+    /confirm-topup  - ยืนยันการเติมเงิน (manual)
+    /stock-info     - ดูจำนวน stock สินค้า
+"""
+
+# ==================== นำเข้าไลบรารี ====================
+
+import os           # สำหรับอ่าน environment variables และจัดการไฟล์
+import sys          # สำหรับ sys.exit() และ sys.executable
+import subprocess   # สำหรับรัน pip install อัตโนมัติ
+import asyncio      # สำหรับ async/await (จำเป็นสำหรับ discord.py)
+
+# ตรวจสอบและติดตั้งไลบรารีที่จำเป็นอัตโนมัติ
+def install_if_missing(package: str, import_name: str = None):
+    """
+    ติดตั้ง package ถ้ายังไม่มีในระบบ
+    package = ชื่อที่ใช้ pip install
+    import_name = ชื่อที่ใช้ import (ถ้าต่างจาก package)
+    """
+    if import_name is None:
+        import_name = package
+    try:
+        __import__(import_name)  # ลอง import ก่อน
+    except ImportError:
+        print(f"[SETUP] กำลังติดตั้ง {package}...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", package, "-q"],
+            # -q = quiet mode (ไม่แสดง output มาก)
+        )
+        print(f"[SETUP] ✅ ติดตั้ง {package} สำเร็จ")
+
+# ติดตั้งไลบรารีที่จำเป็นก่อนนำเข้า
+install_if_missing("discord.py", "discord")
+install_if_missing("python-dotenv", "dotenv")
+
+# นำเข้าหลังจากมั่นใจว่าติดตั้งแล้ว
+import discord                          # ไลบรารีหลักสำหรับ Discord
+from discord.ext import commands        # ระบบ commands ของ discord.py
+from discord import app_commands        # สำหรับ Slash Commands (/)
+from dotenv import load_dotenv          # สำหรับโหลด .env file
+
+# นำเข้าฟังก์ชันจากไฟล์ database.py ที่เราสร้างไว้
+import database as db
+
+# ==================== โหลดค่าตั้งค่า ====================
+
+load_dotenv()  # โหลดตัวแปรจากไฟล์ .env เข้าสู่ environment
+
+# อ่านค่าจาก .env (os.getenv คืนค่า None ถ้าไม่พบ)
+TOKEN = os.getenv("DISCORD_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))          # แปลงเป็น int สำหรับเปรียบเทียบ
+WALLET_NUMBER = os.getenv("WALLET_NUMBER", "")
+BACKEND_CHANNEL_ID = int(os.getenv("BACKEND_CHANNEL_ID", "0"))
+
+# ตรวจสอบว่ามี Token หรือไม่
+if not TOKEN:
+    print("❌ ไม่พบ DISCORD_TOKEN ในไฟล์ .env")
+    print("   กรุณาสร้างไฟล์ .env และใส่ DISCORD_TOKEN=token_ของคุณ")
+    sys.exit(1)  # หยุดโปรแกรม
+
+# ==================== ตั้งค่า Bot ====================
+
+# กำหนด Intents (สิทธิ์ที่บอทต้องการ)
+intents = discord.Intents.default()
+intents.message_content = True   # อ่านเนื้อหาข้อความได้ (ต้องเปิดใน Developer Portal)
+intents.members = True            # เข้าถึงข้อมูล member ได้
+
+# สร้าง Bot instance
+# command_prefix='!' = prefix สำหรับ text commands (เช่น !help)
+# intents = สิทธิ์ที่กำหนดไว้ข้างบน
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ตัวแปรสำหรับเก็บค่าตั้งค่าที่สามารถเปลี่ยนได้ขณะรัน
+config = {
+    "backend_channel_id": BACKEND_CHANNEL_ID,
+    "wallet_number": WALLET_NUMBER,
+}
+
+# ==================== ฟังก์ชันช่วยเหลือ ====================
+
+def is_owner(user_id: int) -> bool:
+    """ตรวจสอบว่าเป็น Owner หรือไม่"""
+    return user_id == OWNER_ID
+
+
+async def send_backend_notification(message: str, embed: discord.Embed = None):
+    """
+    ส่งข้อความแจ้งเตือนไปยัง Backend Channel
+    ใช้สำหรับแจ้ง admin เมื่อมีธุรกรรมเกิดขึ้น
+    """
+    channel_id = config.get("backend_channel_id", 0)
+    if not channel_id:
+        return  # ถ้ายังไม่ได้ตั้งค่า channel ให้ข้ามไป
+
+    channel = bot.get_channel(int(channel_id))
+    if channel:
+        try:
+            if embed:
+                await channel.send(message, embed=embed)
+            else:
+                await channel.send(message)
+        except discord.Forbidden:
+            print(f"[ERROR] บอทไม่มีสิทธิ์ส่งข้อความในช่อง {channel_id}")
+
+
+def create_error_embed(title: str, description: str) -> discord.Embed:
+    """สร้าง Embed สำหรับแสดงข้อผิดพลาด (สีแดง)"""
+    embed = discord.Embed(
+        title=f"❌ {title}",
+        description=description,
+        color=discord.Color.red()  # สีแดง
+    )
+    return embed
+
+
+def create_success_embed(title: str, description: str) -> discord.Embed:
+    """สร้าง Embed สำหรับแสดงความสำเร็จ (สีเขียว)"""
+    embed = discord.Embed(
+        title=f"✅ {title}",
+        description=description,
+        color=discord.Color.green()  # สีเขียว
+    )
+    return embed
+
+
+def create_info_embed(title: str, description: str) -> discord.Embed:
+    """สร้าง Embed สำหรับแสดงข้อมูลทั่วไป (สีน้ำเงิน)"""
+    embed = discord.Embed(
+        title=f"ℹ️ {title}",
+        description=description,
+        color=discord.Color.blue()  # สีน้ำเงิน
+    )
+    return embed
+
+
+# ==================== Events ====================
+
+@bot.event
+async def on_ready():
+    """
+    Event นี้จะถูกเรียกเมื่อบอทเชื่อมต่อ Discord สำเร็จ
+    ใช้สำหรับ initialize ระบบต่างๆ
+    """
+    print(f"[BOT] ✅ บอทพร้อมใช้งาน: {bot.user.name}#{bot.user.discriminator}")
+    print(f"[BOT] ID: {bot.user.id}")
+    print(f"[BOT] Server ที่เข้าร่วม: {len(bot.guilds)} เซิร์ฟเวอร์")
+
+    # สร้างฐานข้อมูลถ้ายังไม่มี
+    db.init_db()
+
+    # Sync slash commands กับ Discord
+    # (ทำให้คำสั่ง / ปรากฏใน Discord)
+    try:
+        synced = await bot.tree.sync()
+        print(f"[BOT] ✅ Sync slash commands สำเร็จ: {len(synced)} คำสั่ง")
+    except Exception as e:
+        print(f"[BOT] ❌ Sync slash commands ล้มเหลว: {e}")
+
+    # ตั้งค่า Activity (สถานะที่แสดงใต้ชื่อบอท)
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="🛒 ร้านขายรหัสเกม | /shop"
+        )
+    )
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """
+    จัดการ error สำหรับ text commands (!)
+    """
+    if isinstance(error, commands.CommandNotFound):
+        return  # ไม่ต้องแจ้งถ้าพิมพ์คำสั่งผิด
+    print(f"[ERROR] {error}")
+
+
+# ==================== Slash Commands: ผู้ใช้ทั่วไป ====================
+
+@bot.tree.command(name="balance", description="ตรวจสอบยอดเงินในกระเป๋าของคุณ")
+async def balance_command(interaction: discord.Interaction):
+    """
+    /balance - แสดงยอดเงินของผู้ใช้
+    interaction = ข้อมูลการโต้ตอบ (ใครพิมพ์, ที่ไหน, เมื่อไหร่)
+    """
+    user_id = str(interaction.user.id)  # ดึง ID ของผู้ใช้ที่พิมพ์คำสั่ง
+    balance = db.get_balance(user_id)   # ดึงยอดเงินจากฐานข้อมูล
+
+    embed = discord.Embed(
+        title="💰 กระเป๋าเงินของคุณ",
+        color=discord.Color.gold()  # สีทอง
+    )
+    embed.add_field(
+        name="ยอดเงินคงเหลือ",
+        value=f"**{balance:,.2f} บาท**",  # format ตัวเลขให้มีทศนิยม 2 ตำแหน่ง
+        inline=False
+    )
+    embed.set_footer(text=f"User ID: {user_id}")
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)  # รูปโปรไฟล์ผู้ใช้
+
+    # ephemeral=True = แสดงเฉพาะผู้ที่พิมพ์คำสั่งเท่านั้น (คนอื่นไม่เห็น)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# คลาสสำหรับปุ่มกดซื้อสินค้า
+class ShopButtons(discord.ui.View):
+    def __init__(self, products):
+        super().__init__(timeout=None)  # ปุ่มจะไม่หมดอายุ
+        for p in products:
+            # สร้างปุ่มสำหรับสินค้าแต่ละชิ้น
+            button = discord.ui.Button(
+                label=f"ซื้อ {p['name']} ({p['price']:,.0f} บาท)",
+                style=discord.ButtonStyle.success,
+                custom_id=f"buy_btn_{p['id']}"
+            )
+            button.callback = self.create_callback(p['id'])
+            self.add_item(button)
+
+    def create_callback(self, product_id):
+        async def callback(interaction: discord.Interaction):
+            # เมื่อลูกค้ากดปุ่ม จะส่งข้อความบอกวิธีซื้อให้เขาเห็นคนเดียว
+            await interaction.response.send_message(
+                f"🛒 คุณต้องการซื้อสินค้า ID: **{product_id}**\n"
+                f"กรุณาพิมพ์คำสั่ง: `/buy product_id:{product_id}` เพื่อทำการสั่งซื้อครับ",
+                ephemeral=True
+            )
+        return callback
+
+
+@bot.tree.command(name="shop", description="[Admin Only] ส่งรายการสินค้าลงในช่องแชท")
+@app_commands.checks.has_permissions(administrator=True)  # จำกัดให้เฉพาะ Admin เท่านั้นที่ใช้ได้
+async def shop_command(interaction: discord.Interaction):
+    """
+    /shop - Admin ใช้ส่งหน้าร้านพร้อมปุ่มกดซื้อลงในช่องแชท
+    """
+    products = db.get_all_products()  # ดึงสินค้าทั้งหมด
+
+    if not products:
+        await interaction.response.send_message(
+            embed=create_info_embed("ร้านค้า", "ยังไม่มีสินค้าในร้านค้าขณะนี้"),
+            ephemeral=True
+        )
+        return
+
+    # สร้าง Embed สำหรับแสดงรายการสินค้า
+    embed = discord.Embed(
+        title="✨ ยินดีต้อนรับสู่ร้านค้าของเรา ✨",
+        description="เลือกสินค้าที่ต้องการด้านล่างนี้ได้เลยครับ\nเมื่อกดปุ่ม บอทจะบอกวิธีซื้อให้คุณทราบ",
+        color=discord.Color.gold()
+    )
+
+    for product in products:
+        stock_count = db.get_stock_count(product["id"])  # นับ stock ที่เหลือ
+
+        # แสดงสถานะ stock
+        if stock_count == 0:
+            stock_status = "❌ หมดสต็อก"
+        elif stock_count <= 3:
+            stock_status = f"⚠️ เหลือน้อย ({stock_count} ชิ้น)"
+        else:
+            stock_status = f"✅ มีสินค้า ({stock_count} ชิ้น)"
+
+        embed.add_field(
+            name=f"📦 {product['name']} (ID: {product['id']})",
+            value=(
+                f"**ราคา:** {product['price']:,.2f} บาท\n"
+                f"**รายละเอียด:** {product['description'] or 'ไม่มีคำอธิบาย'}\n"
+                f"**สถานะ:** {stock_status}"
+            ),
+            inline=False
+        )
+
+    # ส่ง Embed พร้อมปุ่มกด (ทุกคนในช่องเห็นได้)
+    view = ShopButtons(products)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+# จัดการ Error เมื่อคนที่ไม่ใช่ Admin พยายามใช้คำสั่ง
+@shop_command.error
+async def shop_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับแอดมินเท่านั้นครับ!"),
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="buy", description="ซื้อสินค้าด้วย ID สินค้า")
+@app_commands.describe(product_id="ID ของสินค้าที่ต้องการซื้อ (ดูได้จาก /shop)")
+async def buy_command(interaction: discord.Interaction, product_id: int):
+    """
+    /buy [product_id] - ซื้อสินค้าและรับรหัสเกมทาง DM
+    """
+    user_id = str(interaction.user.id)
+
+    # ตรวจสอบว่าสินค้ามีอยู่จริง
+    product = db.get_product(product_id)
+    if not product:
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่พบสินค้า", f"ไม่มีสินค้า ID {product_id} ในระบบ"),
+            ephemeral=True
+        )
+        return
+
+    # ตรวจสอบ stock
+    stock = db.get_available_stock(product_id)
+    if not stock:
+        await interaction.response.send_message(
+            embed=create_error_embed(
+                "สินค้าหมดสต็อก",
+                f"สินค้า **{product['name']}** หมดสต็อกแล้ว กรุณารอสินค้าเพิ่มเติม"
+            ),
+            ephemeral=True
+        )
+        return
+
+    # ตรวจสอบยอดเงิน
+    balance = db.get_balance(user_id)
+    price = product["price"]
+
+    if balance < price:
+        shortage = price - balance  # เงินที่ขาด
+        await interaction.response.send_message(
+            embed=create_error_embed(
+                "ยอดเงินไม่เพียงพอ",
+                f"ราคาสินค้า: **{price:,.2f} บาท**\n"
+                f"ยอดเงินของคุณ: **{balance:,.2f} บาท**\n"
+                f"ขาดอีก: **{shortage:,.2f} บาท**\n\n"
+                f"กรุณาติดต่อแอดมินเพื่อเติมเงินครับ"
+            ),
+            ephemeral=True
+        )
+        return
+
+    # ทุกอย่างผ่าน: ทำการซื้อ
+    # 1. หักเงินจากบัญชี
+    new_balance = db.update_balance(user_id, -price)
+
+    # 2. ทำเครื่องหมาย stock ว่าถูกขายแล้ว
+    db.mark_stock_used(stock["id"], user_id)
+
+    # 3. บันทึกธุรกรรม
+    db.add_transaction(
+        user_id,
+        "purchase",
+        price,
+        f"ซื้อ {product['name']} (Stock ID: {stock['id']})"
+    )
+
+    # 4. ส่งรหัสเกมทาง DM (Direct Message)
+    try:
+        dm_embed = discord.Embed(
+            title="🎮 รหัสเกมของคุณ",
+            description=f"ขอบคุณที่ซื้อสินค้ากับเรา!",
+            color=discord.Color.green()
+        )
+        dm_embed.add_field(name="สินค้า", value=product["name"], inline=True)
+        dm_embed.add_field(name="ราคา", value=f"{price:,.2f} บาท", inline=True)
+        dm_embed.add_field(
+            name="🔑 รหัสเกม (Code)",
+            value=f"```\n{stock['code']}\n```",  # แสดงใน code block
+            inline=False
+        )
+        dm_embed.add_field(
+            name="ยอดเงินคงเหลือ",
+            value=f"{new_balance:,.2f} บาท",
+            inline=False
+        )
+        dm_embed.set_footer(text="หากมีปัญหา กรุณาติดต่อ Admin")
+
+        await interaction.user.send(embed=dm_embed)  # ส่ง DM
+        dm_sent = True
+    except discord.Forbidden:
+        # ผู้ใช้ปิด DM ไม่ให้รับข้อความ
+        dm_sent = False
+
+    # 5. แจ้งผลการซื้อในช่องที่พิมพ์คำสั่ง
+    if dm_sent:
+        result_embed = create_success_embed(
+            "ซื้อสินค้าสำเร็จ!",
+            f"ซื้อ **{product['name']}** สำเร็จแล้ว!\n"
+            f"รหัสเกมถูกส่งไปยัง DM ของคุณแล้ว 📩\n"
+            f"ยอดเงินคงเหลือ: **{new_balance:,.2f} บาท**"
+        )
+    else:
+        result_embed = discord.Embed(
+            title="✅ ซื้อสำเร็จ แต่ส่ง DM ไม่ได้",
+            description=(
+                f"ซื้อ **{product['name']}** สำเร็จ แต่ไม่สามารถส่ง DM ได้\n"
+                f"กรุณาเปิดการรับ DM แล้วติดต่อ Admin เพื่อรับรหัส\n"
+                f"ยอดเงินคงเหลือ: **{new_balance:,.2f} บาท**"
+            ),
+            color=discord.Color.orange()
+        )
+
+    await interaction.response.send_message(embed=result_embed, ephemeral=True)
+
+    # 6. แจ้ง Admin ใน Backend Channel
+    admin_embed = discord.Embed(
+        title="🛒 มีการซื้อสินค้า",
+        color=discord.Color.blue()
+    )
+    admin_embed.add_field(name="ผู้ซื้อ", value=f"{interaction.user.mention} ({user_id})", inline=False)
+    admin_embed.add_field(name="สินค้า", value=product["name"], inline=True)
+    admin_embed.add_field(name="ราคา", value=f"{price:,.2f} บาท", inline=True)
+    admin_embed.add_field(name="Stock ID", value=str(stock["id"]), inline=True)
+    admin_embed.add_field(name="ยอดเงินหลังซื้อ", value=f"{new_balance:,.2f} บาท", inline=True)
+
+    await send_backend_notification("", embed=admin_embed)
+
+
+
+@bot.tree.command(name="history", description="ดูประวัติธุรกรรมของคุณ")
+async def history_command(interaction: discord.Interaction):
+    """
+    /history - แสดงประวัติธุรกรรม 10 รายการล่าสุด
+    """
+    user_id = str(interaction.user.id)
+    transactions = db.get_user_transactions(user_id, limit=10)
+
+    if not transactions:
+        await interaction.response.send_message(
+            embed=create_info_embed("ประวัติธุรกรรม", "ยังไม่มีประวัติธุรกรรม"),
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📋 ประวัติธุรกรรม (10 รายการล่าสุด)",
+        color=discord.Color.blue()
+    )
+
+    # แปลงประเภทธุรกรรมเป็นภาษาไทย
+    type_labels = {
+        "topup": "💰 เติมเงิน",
+        "purchase": "🛒 ซื้อสินค้า",
+        "add_point": "➕ Admin เพิ่มเงิน",
+        "deduct_point": "➖ Admin หักเงิน",
+    }
+
+    for t in transactions:
+        trans_type = type_labels.get(t["type"], t["type"])
+        amount_str = f"+{t['amount']:,.2f}" if t["type"] in ["topup", "add_point"] else f"-{t['amount']:,.2f}"
+
+        embed.add_field(
+            name=f"{trans_type} | {amount_str} บาท",
+            value=f"📝 {t['description'] or '-'}\n🕐 {t['created_at']}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ==================== Slash Commands: Admin เท่านั้น ====================
+
+@bot.tree.command(name="setup", description="[Admin] ตั้งค่าบอท")
+@app_commands.describe(
+    backend_channel="ช่องที่ต้องการรับการแจ้งเตือน Admin",
+    wallet_number="เบอร์ TrueMoney Wallet ของคุณ"
+)
+async def setup_command(
+    interaction: discord.Interaction,
+    backend_channel: discord.TextChannel = None,
+    wallet_number: str = None
+):
+    """
+    /setup - ตั้งค่า backend channel และ wallet number
+    เฉพาะ Owner เท่านั้น
+    """
+    # ตรวจสอบสิทธิ์
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Owner เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    changes = []  # เก็บรายการที่เปลี่ยนแปลง
+
+    if backend_channel:
+        config["backend_channel_id"] = backend_channel.id
+        changes.append(f"✅ Backend Channel: {backend_channel.mention}")
+
+    if wallet_number:
+        config["wallet_number"] = wallet_number
+        changes.append(f"✅ Wallet Number: {wallet_number}")
+
+    if not changes:
+        # แสดงค่าปัจจุบัน
+        channel_id = config.get("backend_channel_id", 0)
+        channel_mention = f"<#{channel_id}>" if channel_id else "ยังไม่ได้ตั้งค่า"
+
+        await interaction.response.send_message(
+            embed=create_info_embed(
+                "ค่าตั้งค่าปัจจุบัน",
+                f"Backend Channel: {channel_mention}\n"
+                f"Wallet Number: {config.get('wallet_number', 'ยังไม่ได้ตั้งค่า')}"
+            ),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=create_success_embed("ตั้งค่าสำเร็จ", "\n".join(changes)),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="create-product", description="[Admin] สร้างสินค้าใหม่")
+@app_commands.describe(
+    name="ชื่อสินค้า",
+    price="ราคาสินค้า (บาท)",
+    description="คำอธิบายสินค้า (ไม่บังคับ)"
+)
+async def create_product_command(
+    interaction: discord.Interaction,
+    name: str,
+    price: float,
+    description: str = ""
+):
+    """
+    /create-product - สร้างสินค้าใหม่ในระบบ
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    if price <= 0:
+        await interaction.response.send_message(
+            embed=create_error_embed("ราคาไม่ถูกต้อง", "ราคาต้องมากกว่า 0"),
+            ephemeral=True
+        )
+        return
+
+    # เพิ่มสินค้าลงฐานข้อมูล
+    product_id = db.add_product(name, price, description)
+
+    embed = create_success_embed(
+        "สร้างสินค้าสำเร็จ",
+        f"สร้างสินค้าใหม่แล้ว!\n\n"
+        f"**ID:** {product_id}\n"
+        f"**ชื่อ:** {name}\n"
+        f"**ราคา:** {price:,.2f} บาท\n"
+        f"**คำอธิบาย:** {description or 'ไม่มี'}\n\n"
+        f"ใช้ `/add-stock {product_id} [รหัสเกม]` เพื่อเพิ่ม stock"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="add-stock", description="[Admin] เพิ่มรหัสเกมเข้าสต็อก")
+@app_commands.describe(
+    product_id="ID ของสินค้า",
+    codes="รหัสเกม (ถ้ามีหลายรหัส คั่นด้วย , หรือขึ้นบรรทัดใหม่)"
+)
+async def add_stock_command(interaction: discord.Interaction, product_id: int, codes: str):
+    """
+    /add-stock [product_id] [codes] - เพิ่มรหัสเกมเข้า stock
+    รองรับหลาย code โดยคั่นด้วย comma (,)
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    # ตรวจสอบว่าสินค้ามีอยู่จริง
+    product = db.get_product(product_id)
+    if not product:
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่พบสินค้า", f"ไม่มีสินค้า ID {product_id}"),
+            ephemeral=True
+        )
+        return
+
+    # แยก codes ออกจากกัน (รองรับทั้ง comma และ newline)
+    code_list = [c.strip() for c in codes.replace("\n", ",").split(",") if c.strip()]
+
+    if not code_list:
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีรหัส", "กรุณาใส่รหัสเกมอย่างน้อย 1 รหัส"),
+            ephemeral=True
+        )
+        return
+
+    # เพิ่ม code ทีละรหัส
+    added_count = 0
+    for code in code_list:
+        db.add_stock(product_id, code)
+        added_count += 1
+
+    # นับ stock ทั้งหมดหลังเพิ่ม
+    total_stock = db.get_stock_count(product_id)
+
+    await interaction.response.send_message(
+        embed=create_success_embed(
+            "เพิ่มสต็อกสำเร็จ",
+            f"เพิ่มรหัสเกมสำหรับ **{product['name']}** แล้ว\n\n"
+            f"เพิ่มใหม่: **{added_count} รหัส**\n"
+            f"สต็อกทั้งหมด: **{total_stock} รหัส**"
+        ),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="delete-product", description="[Admin] ลบสินค้าออกจากระบบ")
+@app_commands.describe(product_id="ID ของสินค้าที่ต้องการลบ")
+async def delete_product_command(interaction: discord.Interaction, product_id: int):
+    """
+    /delete-product [product_id] - ลบสินค้าและ stock ทั้งหมด
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    product = db.get_product(product_id)
+    if not product:
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่พบสินค้า", f"ไม่มีสินค้า ID {product_id}"),
+            ephemeral=True
+        )
+        return
+
+    # ขอยืนยันก่อนลบ
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="⚠️ ยืนยันการลบสินค้า",
+            description=(
+                f"คุณต้องการลบสินค้า **{product['name']}** (ID: {product_id}) ใช่หรือไม่?\n"
+                f"การลบจะลบ stock ทั้งหมดด้วย!\n\n"
+                f"พิมพ์ `yes` เพื่อยืนยัน หรือรอ 30 วินาทีเพื่อยกเลิก"
+            ),
+            color=discord.Color.orange()
+        ),
+        ephemeral=True
+    )
+
+    # รอข้อความยืนยัน "yes" จากผู้ใช้
+    def check(m):
+        # ตรวจสอบว่าเป็นข้อความจากคนเดิม ในช่องเดิม
+        return (
+            m.author.id == interaction.user.id and
+            m.channel.id == interaction.channel_id and
+            m.content.lower() == "yes"  # ต้องพิมพ์ "yes" ตัวพิมพ์เล็ก
+        )
+
+    try:
+        # รอข้อความ "yes" ภายใน 30 วินาที
+        await bot.wait_for("message", check=check, timeout=30.0)
+
+        # ยืนยันแล้ว ลบสินค้า
+        db.delete_product(product_id)
+        await interaction.followup.send(
+            embed=create_success_embed("ลบสินค้าสำเร็จ", f"ลบสินค้า **{product['name']}** แล้ว"),
+            ephemeral=True
+        )
+    except asyncio.TimeoutError:
+        # หมดเวลา 30 วินาที
+        await interaction.followup.send(
+            embed=create_info_embed("ยกเลิก", "หมดเวลายืนยัน การลบสินค้าถูกยกเลิก"),
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="add-point", description="[Admin] เพิ่มเงินให้ผู้ใช้")
+@app_commands.describe(
+    user="ผู้ใช้ที่ต้องการเพิ่มเงิน",
+    amount="จำนวนเงินที่ต้องการเพิ่ม (บาท)"
+)
+async def add_point_command(interaction: discord.Interaction, user: discord.Member, amount: float):
+    """
+    /add-point [user] [amount] - เพิ่มเงินให้ผู้ใช้ (ต้องยืนยันด้วย "yes")
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message(
+            embed=create_error_embed("จำนวนไม่ถูกต้อง", "จำนวนต้องมากกว่า 0"),
+            ephemeral=True
+        )
+        return
+
+    current_balance = db.get_balance(str(user.id))
+
+    # ขอยืนยัน
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="⚠️ ยืนยันการเพิ่มเงิน",
+            description=(
+                f"เพิ่มเงิน **{amount:,.2f} บาท** ให้ {user.mention}?\n"
+                f"ยอดเงินปัจจุบัน: {current_balance:,.2f} บาท\n"
+                f"ยอดเงินหลังเพิ่ม: {current_balance + amount:,.2f} บาท\n\n"
+                f"พิมพ์ `yes` เพื่อยืนยัน"
+            ),
+            color=discord.Color.orange()
+        ),
+        ephemeral=True
+    )
+
+    def check(m):
+        return (
+            m.author.id == interaction.user.id and
+            m.channel.id == interaction.channel_id and
+            m.content.lower() == "yes"
+        )
+
+    try:
+        await bot.wait_for("message", check=check, timeout=30.0)
+
+        # เพิ่มเงิน
+        new_balance = db.update_balance(str(user.id), amount)
+        db.add_transaction(str(user.id), "add_point", amount, f"Admin เพิ่มเงิน (โดย {interaction.user.name})")
+
+        await interaction.followup.send(
+            embed=create_success_embed(
+                "เพิ่มเงินสำเร็จ",
+                f"เพิ่มเงิน **{amount:,.2f} บาท** ให้ {user.mention} แล้ว\n"
+                f"ยอดเงินใหม่: **{new_balance:,.2f} บาท**"
+            ),
+            ephemeral=True
+        )
+
+        # แจ้งผู้ใช้ที่ได้รับเงิน
+        try:
+            await user.send(
+                embed=create_success_embed(
+                    "ได้รับเงิน!",
+                    f"Admin เพิ่มเงิน **{amount:,.2f} บาท** ให้คุณ\n"
+                    f"ยอดเงินปัจจุบัน: **{new_balance:,.2f} บาท**"
+                )
+            )
+        except discord.Forbidden:
+            pass  # ผู้ใช้ปิด DM
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            embed=create_info_embed("ยกเลิก", "หมดเวลายืนยัน"),
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="deduct-point", description="[Admin] หักเงินจากผู้ใช้")
+@app_commands.describe(
+    user="ผู้ใช้ที่ต้องการหักเงิน",
+    amount="จำนวนเงินที่ต้องการหัก (บาท)"
+)
+async def deduct_point_command(interaction: discord.Interaction, user: discord.Member, amount: float):
+    """
+    /deduct-point [user] [amount] - หักเงินจากผู้ใช้ (ต้องยืนยันด้วย "yes")
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message(
+            embed=create_error_embed("จำนวนไม่ถูกต้อง", "จำนวนต้องมากกว่า 0"),
+            ephemeral=True
+        )
+        return
+
+    current_balance = db.get_balance(str(user.id))
+
+    if current_balance < amount:
+        await interaction.response.send_message(
+            embed=create_error_embed(
+                "ยอดเงินไม่พอ",
+                f"ยอดเงินของ {user.mention}: {current_balance:,.2f} บาท\n"
+                f"ต้องการหัก: {amount:,.2f} บาท\n"
+                f"ยอดเงินไม่เพียงพอ"
+            ),
+            ephemeral=True
+        )
+        return
+
+    # ขอยืนยัน
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="⚠️ ยืนยันการหักเงิน",
+            description=(
+                f"หักเงิน **{amount:,.2f} บาท** จาก {user.mention}?\n"
+                f"ยอดเงินปัจจุบัน: {current_balance:,.2f} บาท\n"
+                f"ยอดเงินหลังหัก: {current_balance - amount:,.2f} บาท\n\n"
+                f"พิมพ์ `yes` เพื่อยืนยัน"
+            ),
+            color=discord.Color.red()
+        ),
+        ephemeral=True
+    )
+
+    def check(m):
+        return (
+            m.author.id == interaction.user.id and
+            m.channel.id == interaction.channel_id and
+            m.content.lower() == "yes"
+        )
+
+    try:
+        await bot.wait_for("message", check=check, timeout=30.0)
+
+        new_balance = db.update_balance(str(user.id), -amount)
+        db.add_transaction(str(user.id), "deduct_point", amount, f"Admin หักเงิน (โดย {interaction.user.name})")
+
+        await interaction.followup.send(
+            embed=create_success_embed(
+                "หักเงินสำเร็จ",
+                f"หักเงิน **{amount:,.2f} บาท** จาก {user.mention} แล้ว\n"
+                f"ยอดเงินใหม่: **{new_balance:,.2f} บาท**"
+            ),
+            ephemeral=True
+        )
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            embed=create_info_embed("ยกเลิก", "หมดเวลายืนยัน"),
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="confirm-topup", description="[Admin] ยืนยันการเติมเงินของผู้ใช้")
+@app_commands.describe(
+    user_id="Discord User ID ของผู้เติมเงิน",
+    amount="จำนวนเงินที่ยืนยัน (บาท)"
+)
+async def confirm_topup_command(interaction: discord.Interaction, user_id: str, amount: float):
+    """
+    /confirm-topup [user_id] [amount] - Admin ยืนยันการเติมเงิน
+    หลังจากตรวจสอบ Angpao link แล้ว
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message(
+            embed=create_error_embed("จำนวนไม่ถูกต้อง", "จำนวนต้องมากกว่า 0"),
+            ephemeral=True
+        )
+        return
+
+    # เพิ่มเงินให้ผู้ใช้
+    new_balance = db.update_balance(user_id, amount)
+    db.add_transaction(user_id, "topup", amount, f"เติมเงินผ่าน TrueMoney Wallet (ยืนยันโดย {interaction.user.name})")
+
+    await interaction.response.send_message(
+        embed=create_success_embed(
+            "ยืนยันการเติมเงินสำเร็จ",
+            f"เติมเงิน **{amount:,.2f} บาท** ให้ User ID: {user_id} แล้ว\n"
+            f"ยอดเงินใหม่: **{new_balance:,.2f} บาท**"
+        ),
+        ephemeral=True
+    )
+
+    # แจ้งผู้ใช้ที่เติมเงิน
+    try:
+        user = await bot.fetch_user(int(user_id))  # ดึงข้อมูล user จาก ID
+        await user.send(
+            embed=create_success_embed(
+                "เติมเงินสำเร็จ! 💰",
+                f"Admin ยืนยันการเติมเงิน **{amount:,.2f} บาท** แล้ว\n"
+                f"ยอดเงินปัจจุบัน: **{new_balance:,.2f} บาท**\n\n"
+                f"ขอบคุณที่ใช้บริการ!"
+            )
+        )
+    except (discord.NotFound, discord.Forbidden, ValueError):
+        pass  # ไม่พบ user หรือ user ปิด DM
+
+
+@bot.tree.command(name="stock-info", description="[Admin] ดูจำนวน stock ของสินค้าทั้งหมด")
+async def stock_info_command(interaction: discord.Interaction):
+    """
+    /stock-info - แสดงจำนวน stock ที่เหลือของทุกสินค้า
+    """
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message(
+            embed=create_error_embed("ไม่มีสิทธิ์", "คำสั่งนี้สำหรับ Admin เท่านั้น"),
+            ephemeral=True
+        )
+        return
+
+    products = db.get_all_products()
+
+    if not products:
+        await interaction.response.send_message(
+            embed=create_info_embed("ข้อมูลสต็อก", "ยังไม่มีสินค้าในระบบ"),
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📦 ข้อมูลสต็อกสินค้า (Admin)",
+        color=discord.Color.dark_blue()
+    )
+
+    for product in products:
+        stock_count = db.get_stock_count(product["id"])
+        embed.add_field(
+            name=f"[ID: {product['id']}] {product['name']}",
+            value=f"ราคา: {product['price']:,.2f} บาท | สต็อก: **{stock_count} ชิ้น**",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ==================== รัน Bot ====================
+
+if __name__ == "__main__":
+    # __name__ == "__main__" หมายความว่าไฟล์นี้ถูกรันโดยตรง (ไม่ใช่ import)
+    print("=" * 50)
+    print("  Discord Shop Bot - กำลังเริ่มทำงาน...")
+    print("=" * 50)
+    bot.run(os.environ['DISCORD_TOKEN'])
