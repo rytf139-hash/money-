@@ -194,3 +194,187 @@ Tab:Button({
         if dd.Refresh then dd:Refresh(buildOptions()) end
     end,
 })
+
+-- =====================================================================
+-- Auto Ride: ขับวนลูปบนทางด่วนเรื่อยๆ / ไม่ล้ม / นั่งรถตลอด
+-- =====================================================================
+local CollectionService = game:GetService("CollectionService")
+
+local auto = {
+    ride = false,        -- ขับอัตโนมัติ
+    noCrash = true,      -- ไม่ล้ม/ไม่โดนเหวี่ยง
+    stayOnBike = true,   -- นั่งรถตลอด (ขึ้นรถของตัวเองอัตโนมัติ)
+    boost = 0,           -- บูสต์ความเร็ว studs/s (0 = ปิด)
+    laneOffset = 8,      -- ห่างจากกึ่งกลางถนน (แกน Z)
+    dir = 1,             -- 1 = ไปทาง EndX, -1 = ย้อนกลับ
+    steerSign = 1,       -- เครื่องหมายเลี้ยว (ปรับเองอัตโนมัติ)
+}
+
+local function req(inst) local ok, m = pcall(require, inst) return ok and m or nil end
+local TouchControls = req(RS:WaitForChild("TouchControls", 10))
+local Traffic       = req(RS:WaitForChild("HighwayTraffic", 10))
+local Physics       = req(RS:WaitForChild("ScooterPhysics", 10))
+
+local function activeBike()
+    return Physics and Physics.active
+end
+
+local function highway()
+    local hw = workspace:FindFirstChild("LongHighway")
+    if not hw then return end
+    return hw:GetAttribute("CenterZ") or 0, hw:GetAttribute("StartX"), hw:GetAttribute("EndX")
+end
+
+local lastErr, lastCheck, steerAcc, steerN = nil, os.clock(), 0, 0
+local function calcSteer()
+    local b = activeBike()
+    local cz = highway()
+    if not (b and b.chassis and cz) then return 0 end
+    local cf = b.chassis.CFrame
+    local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+    if look.Magnitude < 0.01 then return 0 end
+    look = look.Unit
+    local laneZ = cz + auto.laneOffset
+    local lat = math.clamp((laneZ - cf.Position.Z) * 0.03, -0.6, 0.6) * auto.dir
+    local want = Vector3.new(auto.dir, 0, lat).Unit
+    local cross = look:Cross(want).Y            -- >0 = เป้าหมายอยู่ซ้าย
+    local angle = math.acos(math.clamp(look:Dot(want), -1, 1))
+    local s = math.clamp(-cross * 3, -1, 1) * auto.steerSign
+    -- เรียนรู้เครื่องหมายเลี้ยวเอง: ถ้าสั่งเลี้ยวแล้วมุมผิดยิ่งโตขึ้น ให้กลับเครื่องหมาย
+    steerAcc += math.abs(s); steerN += 1
+    if os.clock() - lastCheck > 2 then
+        if lastErr and steerN > 0 and steerAcc / steerN > 0.3 and angle > lastErr + 0.25 then
+            auto.steerSign = -auto.steerSign
+        end
+        lastErr, lastCheck, steerAcc, steerN = angle, os.clock(), 0, 0
+    end
+    return s
+end
+
+-- ===== Hook 1: คุมคันเร่ง/พวงมาลัย =====
+if TouchControls and TouchControls.drive then
+    local orig = TouchControls.drive
+    TouchControls.drive = function(...)
+        if auto.ride and activeBike() then return 1, calcSteer() end
+        return orig(...)
+    end
+end
+
+-- ===== Hook 2: ชนรถบนทางด่วนแล้วไม่ล้ม =====
+if Traffic and Traffic.collide then
+    local orig = Traffic.collide
+    Traffic.collide = function(...)
+        if auto.noCrash then return nil end
+        return orig(...)
+    end
+end
+
+-- ===== Hook 3: ล้างสถานะล้ม (lowside/endo/highside/loop) หลังฟิสิกส์ทุกเฟรม =====
+if Physics and Physics.step then
+    local orig = Physics.step
+    Physics.step = function(self, ...)
+        local r = table.pack(orig(self, ...))
+        if auto.noCrash then
+            self.crash = nil
+            self.loopedOut = false
+        end
+        return table.unpack(r, 1, r.n)
+    end
+end
+
+-- ===== นั่งรถตลอด + กลับขึ้นถนน + บูสต์ =====
+local function myBike()
+    for _, m in ipairs(CollectionService:GetTagged("Scooter")) do
+        if m:GetAttribute("Owner") == lp.UserId then return m end
+    end
+end
+
+local lastMount = 0
+local function ensureSeated()
+    local char = lp.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.SeatPart then return end
+    if os.clock() - lastMount < 2 then return end
+    lastMount = os.clock()
+    local bike = myBike()
+    local seat = bike and bike:FindFirstChild("DriverSeat")
+    if not seat then return end
+    char:PivotTo(seat.CFrame * CFrame.new(0, 2, 0))
+    task.wait(0.15)
+    if not hum.SeatPart then pcall(function() seat:Sit(hum) end) end
+end
+
+local function backToRoad()
+    local b = activeBike()
+    local cz, sx, ex = highway()
+    if not (b and b.chassis and cz and sx and ex) then return end
+    local p = b.chassis.Position
+    if math.abs(p.Z - (cz + auto.laneOffset)) > 90 or p.Y > 400 or p.Y < -50 then
+        local x = math.clamp(p.X, sx + 400, ex - 400)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {lp.Character, b.model}
+        local hit = workspace:Raycast(Vector3.new(x, 380, cz + auto.laneOffset), Vector3.new(0, -500, 0), params)
+        local y = (hit and hit.Position.Y or 20) + 4
+        b.model:PivotTo(CFrame.lookAt(Vector3.new(x, y, cz + auto.laneOffset),
+            Vector3.new(x + auto.dir, y, cz + auto.laneOffset)))
+        b.chassis.AssemblyLinearVelocity = Vector3.zero
+        b.chassis.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if auto.stayOnBike or auto.ride then task.spawn(ensureSeated) end
+    local b = activeBike()
+    if not b or not b.chassis then return end
+    if auto.ride then
+        backToRoad()
+        if auto.boost > 0 then
+            local look = b.chassis.CFrame.LookVector
+            local v = b.chassis.AssemblyLinearVelocity
+            local flat = Vector3.new(v.X, 0, v.Z).Magnitude
+            if flat < auto.boost then
+                b.chassis.AssemblyLinearVelocity = Vector3.new(look.X * auto.boost, v.Y, look.Z * auto.boost)
+            end
+        end
+    end
+end)
+
+-- ===== UI =====
+local AutoTab = Window:Tab({Title = "Auto Ride", Icon = "route"})
+
+AutoTab:Toggle({
+    Title = "ขับวนลูปทางด่วนอัตโนมัติ",
+    Value = false,
+    Callback = function(v) auto.ride = v end,
+})
+AutoTab:Toggle({
+    Title = "ไม่ล้ม / ไม่โดนเหวี่ยงเวลาชน",
+    Value = true,
+    Callback = function(v) auto.noCrash = v end,
+})
+AutoTab:Toggle({
+    Title = "นั่งรถตลอดเวลา (ขึ้นรถอัตโนมัติ)",
+    Value = true,
+    Callback = function(v) auto.stayOnBike = v end,
+})
+AutoTab:Slider({
+    Title = "บูสต์ความเร็ว (0 = ปิด)",
+    Value = {Min = 0, Max = 600, Default = 0},
+    Step = 10,
+    Callback = function(v) auto.boost = v end,
+})
+AutoTab:Slider({
+    Title = "เลนซ้าย/ขวา (ห่างจากกลางถนน)",
+    Value = {Min = -30, Max = 30, Default = auto.laneOffset},
+    Step = 1,
+    Callback = function(v) auto.laneOffset = v end,
+})
+AutoTab:Button({
+    Title = "กลับทิศทางขับ",
+    Callback = function() auto.dir = -auto.dir end,
+})
+AutoTab:Button({
+    Title = "กลับเครื่องหมายเลี้ยว (ถ้าเลี้ยวผิดทาง)",
+    Callback = function() auto.steerSign = -auto.steerSign end,
+})
