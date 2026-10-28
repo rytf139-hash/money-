@@ -1,692 +1,173 @@
---[[
-    Bike Universe - AutoDrive Smooth Waypoint UI
-    --------------------------------------------
-    วางเป็น LocalScript ใน StarterPlayerScripts ของเกมที่คุณเป็นเจ้าของ
-    หรือใช้ในสภาพแวดล้อมทดสอบที่คุณได้รับอนุญาตเท่านั้น
-
-    ข้อมูลที่ใช้จาก source ที่ให้มา:
-      - ReplicatedStorage.TouchControls: throttle / steer
-      - Scooter model tag: "Scooter"
-      - Driver seat attribute: IsScooterSeat
-      - Model chassis: "Chassis"
-      - Optional model attribute: MaxSpeedKmh
-
-    หมายเหตุ: ไม่ Tween CFrame ของตัวรถโดยตรง เพราะเกมขับด้วย ScooterPhysics
-    สคริปต์นี้ขับตาม waypoint ผ่าน throttle/steer ของระบบเดิม และ Tween เฉพาะ UI
-]]
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local CollectionService = game:GetService("CollectionService")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local TouchControls = require(ReplicatedStorage:WaitForChild("TouchControls"))
-
--- WindUI (ใช้เฉพาะในเกม/สภาพแวดล้อมที่ได้รับอนุญาต)
+-- Bike Universe | Teleport ไปจุดที่ได้เงินเยอะที่สุด (Tween อิสระ + ปรับความเร็วได้)
 local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
 
--- =========================
--- SETTINGS
--- =========================
-local MIN_SPEED_KMH = 10
-local MAX_SPEED_KMH = 1000
-local DEFAULT_SPEED_KMH = 70
-local ARRIVE_DISTANCE = 8
-local MAX_WAYPOINTS = 20
-local STEER_RESPONSE_ANGLE = math.rad(42)
-local AUTO_AVOID_DEFAULT = true
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local lp = Players.LocalPlayer
 
-local desiredSpeedKmh = DEFAULT_SPEED_KMH
-local waypoints = {}
-local waypointIndex = 1
-local driving = false
-local avoidObstacles = AUTO_AVOID_DEFAULT
-local lastActualSpeed = 0
-local lastStatus = "พร้อมใช้งาน"
-local dragPanel = false
-local panelDragStart = nil
-local panelStartPosition = nil
-local draggingSlider = false
+local speed = 150        -- studs/วินาที
+local heightOffset = 6
+local currentTween      -- {cancel=function}
+local selected = "Best Race (Prize สูงสุด)"
 
--- =========================
--- HELPERS: VEHICLE / INPUT
--- =========================
-local function getCurrentScooter()
-    local character = player.Character
-    if not character then
-        return nil, nil, nil
+-- ===== หา root ที่จะเคลื่อน (บอกถ้านั่งบนไบค์ จะเลื่อนทั้งคัน) =====
+local function getMover()
+    local char = lp.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local seat = hum and hum.SeatPart
+    if seat then
+        local model = seat:FindFirstAncestorOfClass("Model")
+        if model and model ~= char then return model, true end
     end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local seat = humanoid and humanoid.SeatPart
-    if not seat or not seat:IsA("VehicleSeat") then
-        return nil, nil, nil
-    end
-    if seat:GetAttribute("IsScooterSeat") ~= true then
-        return nil, nil, nil
-    end
-
-    local model = seat.Parent
-    while model and model ~= workspace and not CollectionService:HasTag(model, "Scooter") do
-        model = model.Parent
-    end
-    if not model or model == workspace then
-        return nil, nil, nil
-    end
-
-    local chassis = model:FindFirstChild("Chassis")
-    if not chassis or not chassis:IsA("BasePart") then
-        return nil, nil, nil
-    end
-
-    return model, seat, chassis
+    return char, false
 end
 
-local function releaseAutoInput()
-    -- ปล่อยคันเร่ง/เลี้ยวที่สคริปต์ตั้งไว้
-    TouchControls.throttle = 0
-    TouchControls.steer = 0
+local function pivotOf(m) return m:GetPivot() end
+
+-- ===== Tween อิสระ: เคลื่อนด้วย speed คงที่ (ปรับได้ระหว่างเดิน) =====
+local function stopTween()
+    if currentTween then currentTween.cancel() currentTween = nil end
 end
 
-local function flatUnit(vector)
-    local flat = Vector3.new(vector.X, 0, vector.Z)
-    if flat.Magnitude < 0.001 then
-        return Vector3.zero
+local function flyTo(targetPos)
+    stopTween()
+    local mover = getMover()
+    if not mover then return WindUI:Notify({Title="Error", Content="ไม่พบตัวละคร", Duration=3}) end
+    local cancelled = false
+    local conn
+    local function restore()
+        if conn then conn:Disconnect() end
     end
-    return flat.Unit
-end
-
-local function makeRaycastParams(model)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    local excluded = { model }
-    if player.Character then
-        table.insert(excluded, player.Character)
-    end
-    params.FilterDescendantsInstances = excluded
-    params.IgnoreWater = true
-    return params
-end
-
-local function steerToward(chassis, target)
-    local direction = flatUnit(target - chassis.Position)
-    local forward = flatUnit(chassis.CFrame.LookVector)
-    if direction == Vector3.zero or forward == Vector3.zero then
-        return 0, 0
-    end
-
-    -- right vector สำหรับ forward แนวราบ; target อยู่ขวาจะได้ steering เป็นบวก
-    local right = Vector3.new(-forward.Z, 0, forward.X)
-    local angle = math.atan2(direction:Dot(right), direction:Dot(forward))
-    local steer = math.clamp(angle / STEER_RESPONSE_ANGLE, -1, 1)
-    return steer, angle
-end
-
-local function avoidObstacle(model, chassis, steer, throttle, currentSpeedKmh, angle)
-    if not avoidObstacles then
-        return steer, throttle, false
-    end
-
-    local forward = flatUnit(chassis.CFrame.LookVector)
-    if forward == Vector3.zero then
-        return steer, throttle, false
-    end
-
-    local right = Vector3.new(-forward.Z, 0, forward.X)
-    local rayLength = math.clamp(10 + currentSpeedKmh * 0.08, 10, 24)
-    local origin = chassis.Position + Vector3.new(0, 2.2, 0)
-    local params = makeRaycastParams(model)
-    local ahead = workspace:Raycast(origin, forward * rayLength, params)
-
-    if not ahead or not ahead.Instance or not ahead.Instance.CanCollide then
-        return steer, throttle, false
-    end
-
-    local leftDirection = (forward - right * 0.6).Unit
-    local rightDirection = (forward + right * 0.6).Unit
-    local leftHit = workspace:Raycast(origin, leftDirection * rayLength, params)
-    local rightHit = workspace:Raycast(origin, rightDirection * rayLength, params)
-
-    if not rightHit then
-        steer = 0.85
-        throttle = math.min(throttle, 0.35)
-    elseif not leftHit then
-        steer = -0.85
-        throttle = math.min(throttle, 0.35)
-    else
-        -- ทางแคบหรือถูกบังทั้งสองด้าน ให้ชะลอแทนการเร่งชน
-        steer = math.abs(angle) > 0.12 and math.sign(angle) or 0
-        throttle = -0.25
-    end
-
-    return steer, throttle, true
-end
-
-local function getThrottleForSpeed(targetSpeedKmh, currentSpeedKmh)
-    local difference = targetSpeedKmh - currentSpeedKmh
-    if difference > 10 then
-        return 1
-    elseif difference > 3 then
-        return 0.55
-    elseif difference > 0.5 then
-        return 0.25
-    elseif difference < -12 then
-        return -0.35
-    elseif difference < -5 then
-        return -0.15
-    end
-    return 0
-end
-
--- =========================
--- WINDUI: SPEED CONTROL
--- =========================
-local WindWindow = WindUI:CreateWindow({
-    Title = "Bike Universe | Auto Drive",
-    Icon = "bike",
-    Author = "Auto Drive",
-    Folder = "BikeUniverseAutoDrive"
-})
-local DriveTab = WindWindow:Tab({ Title = "Auto Drive", Icon = "gauge" })
-DriveTab:Slider({
-    Title = "ความเร็วเป้าหมาย (km/h)",
-    Desc = "ปรับได้ 1–1000 ตามต้องการ แต่ความเร็วจริงขึ้นกับฟิสิกส์/ค่าสูงสุดของรถ",
-    Step = 1,
-    Value = { Min = 1, Max = 1000, Default = DEFAULT_SPEED_KMH },
-    Callback = function(value)
-        desiredSpeedKmh = math.clamp(tonumber(value) or DEFAULT_SPEED_KMH, 1, 1000)
-    end
-})
-DriveTab:Button({
-    Title = "รีเซ็ตความเร็วเป็น 70",
-    Callback = function()
-        desiredSpeedKmh = 70
-    end
-})
-
--- =========================
--- UI BUILDERS
--- =========================
-local oldGui = playerGui:FindFirstChild("BikeUniverseAutoDrive")
-if oldGui then
-    oldGui:Destroy()
-end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "BikeUniverseAutoDrive"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = false
-gui.DisplayOrder = 80
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = playerGui
-
-local COLORS = {
-    panel = Color3.fromRGB(19, 22, 30),
-    header = Color3.fromRGB(29, 34, 46),
-    field = Color3.fromRGB(34, 39, 52),
-    text = Color3.fromRGB(242, 245, 250),
-    muted = Color3.fromRGB(166, 176, 194),
-    accent = Color3.fromRGB(44, 175, 255),
-    green = Color3.fromRGB(40, 190, 110),
-    red = Color3.fromRGB(220, 65, 75),
-    yellow = Color3.fromRGB(238, 174, 55),
-}
-
-local function addCorner(instance, radius)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, radius or 8)
-    corner.Parent = instance
-    return corner
-end
-
-local function addStroke(instance, color, transparency, thickness)
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = color or Color3.fromRGB(76, 88, 110)
-    stroke.Transparency = transparency or 0.3
-    stroke.Thickness = thickness or 1
-    stroke.Parent = instance
-    return stroke
-end
-
-local function makeLabel(parent, name, text, position, size, textSize, color, xAlign)
-    local label = Instance.new("TextLabel")
-    label.Name = name
-    label.BackgroundTransparency = 1
-    label.Position = position
-    label.Size = size
-    label.Font = Enum.Font.GothamMedium
-    label.Text = text
-    label.TextSize = textSize or 13
-    label.TextColor3 = color or COLORS.text
-    label.TextXAlignment = xAlign or Enum.TextXAlignment.Left
-    label.TextYAlignment = Enum.TextYAlignment.Center
-    label.Parent = parent
-    return label
-end
-
-local function makeButton(parent, name, text, position, size, color)
-    local button = Instance.new("TextButton")
-    button.Name = name
-    button.Position = position
-    button.Size = size
-    button.AutoButtonColor = true
-    button.BackgroundColor3 = color or COLORS.field
-    button.BorderSizePixel = 0
-    button.Font = Enum.Font.GothamBold
-    button.Text = text
-    button.TextSize = 12
-    button.TextColor3 = COLORS.text
-    button.Parent = parent
-    addCorner(button, 8)
-    return button
-end
-
-local panel = Instance.new("Frame")
-panel.Name = "Panel"
-panel.AnchorPoint = Vector2.new(0.5, 0.5)
-panel.Position = UDim2.fromScale(0.5, 0.5)
-panel.Size = UDim2.fromOffset(340, 500)
-panel.BackgroundColor3 = COLORS.panel
-panel.BorderSizePixel = 0
-panel.Parent = gui
-addCorner(panel, 14)
-addStroke(panel, Color3.fromRGB(82, 104, 140), 0.22, 1.2)
-
-local header = Instance.new("Frame")
-header.Name = "Header"
-header.Size = UDim2.new(1, 0, 0, 38)
-header.BackgroundColor3 = COLORS.header
-header.BorderSizePixel = 0
-header.Parent = panel
-addCorner(header, 14)
-
-local headerMask = Instance.new("Frame")
-headerMask.Position = UDim2.new(0, 0, 1, -12)
-headerMask.Size = UDim2.new(1, 0, 0, 12)
-headerMask.BackgroundColor3 = COLORS.header
-headerMask.BorderSizePixel = 0
-headerMask.Parent = header
-
-makeLabel(header, "Title", "BIKE UNIVERSE  •  AUTO DRIVE", UDim2.fromOffset(12, 0), UDim2.new(1, -54, 1, 0), 13, COLORS.text)
-local minimizeButton = makeButton(header, "Minimize", "—", UDim2.new(1, -38, 0, 5), UDim2.fromOffset(28, 27), COLORS.field)
-
-local speedTitle = makeLabel(panel, "SpeedTitle", "ความเร็วเป้าหมาย", UDim2.fromOffset(14, 46), UDim2.fromOffset(170, 22), 13, COLORS.text)
-local speedLabel = makeLabel(panel, "SpeedValue", tostring(DEFAULT_SPEED_KMH) .. " km/h", UDim2.new(1, -110, 0, 46), UDim2.fromOffset(96, 22), 13, COLORS.accent, Enum.TextXAlignment.Right)
-
-local sliderTrack = Instance.new("Frame")
-sliderTrack.Name = "SpeedSlider"
-sliderTrack.Position = UDim2.fromOffset(14, 74)
-sliderTrack.Size = UDim2.new(1, -28, 0, 12)
-sliderTrack.BackgroundColor3 = COLORS.field
-sliderTrack.BorderSizePixel = 0
-sliderTrack.Parent = panel
-addCorner(sliderTrack, 6)
-
-local sliderFill = Instance.new("Frame")
-sliderFill.Name = "Fill"
-sliderFill.Size = UDim2.new((DEFAULT_SPEED_KMH - MIN_SPEED_KMH) / (MAX_SPEED_KMH - MIN_SPEED_KMH), 0, 1, 0)
-sliderFill.BackgroundColor3 = COLORS.accent
-sliderFill.BorderSizePixel = 0
-sliderFill.Parent = sliderTrack
-addCorner(sliderFill, 6)
-
-local sliderKnob = Instance.new("Frame")
-sliderKnob.Name = "Knob"
-sliderKnob.AnchorPoint = Vector2.new(0.5, 0.5)
-sliderKnob.Position = UDim2.new((DEFAULT_SPEED_KMH - MIN_SPEED_KMH) / (MAX_SPEED_KMH - MIN_SPEED_KMH), 0, 0.5, 0)
-sliderKnob.Size = UDim2.fromOffset(18, 18)
-sliderKnob.BackgroundColor3 = COLORS.text
-sliderKnob.BorderSizePixel = 0
-sliderKnob.Parent = sliderTrack
-addCorner(sliderKnob, 9)
-addStroke(sliderKnob, COLORS.accent, 0, 2)
-
-makeLabel(panel, "SpeedMin", tostring(MIN_SPEED_KMH), UDim2.fromOffset(14, 88), UDim2.fromOffset(45, 16), 10, COLORS.muted)
-makeLabel(panel, "SpeedMax", tostring(MAX_SPEED_KMH) .. " km/h", UDim2.new(1, -88, 0, 88), UDim2.fromOffset(74, 16), 10, COLORS.muted, Enum.TextXAlignment.Right)
-
-makeLabel(panel, "CoordsLabel", "กำหนดจุดหมาย (พิกัด X / Y / Z)", UDim2.fromOffset(14, 110), UDim2.new(1, -28, 0, 20), 12, COLORS.text)
-
-local function makeInput(name, placeholder, position)
-    local box = Instance.new("TextBox")
-    box.Name = name
-    box.Position = position
-    box.Size = UDim2.fromOffset(96, 32)
-    box.BackgroundColor3 = COLORS.field
-    box.BorderSizePixel = 0
-    box.ClearTextOnFocus = false
-    box.Font = Enum.Font.GothamMedium
-    box.PlaceholderText = placeholder
-    box.PlaceholderColor3 = COLORS.muted
-    box.Text = ""
-    box.TextColor3 = COLORS.text
-    box.TextSize = 13
-    box.TextXAlignment = Enum.TextXAlignment.Center
-    box.Parent = panel
-    addCorner(box, 8)
-    addStroke(box, Color3.fromRGB(71, 84, 106), 0.5, 1)
-    return box
-end
-
-local xInput = makeInput("XInput", "X", UDim2.fromOffset(14, 134))
-local yInput = makeInput("YInput", "Y", UDim2.fromOffset(122, 134))
-local zInput = makeInput("ZInput", "Z", UDim2.fromOffset(230, 134))
-
-local addPointButton = makeButton(panel, "AddCoordinate", "+ เพิ่มพิกัด", UDim2.fromOffset(14, 174), UDim2.new(1, -28, 0, 30), COLORS.accent)
-local saveCurrentButton = makeButton(panel, "SaveCurrent", "+ บันทึกตำแหน่งรถเป็นจุดหมาย", UDim2.fromOffset(14, 210), UDim2.new(1, -28, 0, 30), COLORS.field)
-
-makeLabel(panel, "WaypointsTitle", "เส้นทางที่บันทึกไว้ (เรียงตามลำดับ)", UDim2.fromOffset(14, 246), UDim2.new(1, -28, 0, 19), 12, COLORS.text)
-local routeBox = Instance.new("TextLabel")
-routeBox.Name = "WaypointsList"
-routeBox.Position = UDim2.fromOffset(14, 267)
-routeBox.Size = UDim2.new(1, -28, 0, 76)
-routeBox.BackgroundColor3 = Color3.fromRGB(14, 17, 23)
-routeBox.BorderSizePixel = 0
-routeBox.Font = Enum.Font.Code
-routeBox.Text = "ยังไม่มีจุดหมาย"
-routeBox.TextColor3 = COLORS.muted
-routeBox.TextSize = 11
-routeBox.TextXAlignment = Enum.TextXAlignment.Left
-routeBox.TextYAlignment = Enum.TextYAlignment.Top
-routeBox.TextWrapped = false
-routeBox.Parent = panel
-addCorner(routeBox, 8)
-local routePadding = Instance.new("UIPadding")
-routePadding.PaddingLeft = UDim.new(0, 8)
-routePadding.PaddingTop = UDim.new(0, 6)
-routePadding.Parent = routeBox
-
-local startButton = makeButton(panel, "Start", "▶ เริ่มขับ", UDim2.fromOffset(14, 351), UDim2.new(0.5, -20, 0, 36), COLORS.green)
-local stopButton = makeButton(panel, "Stop", "■ หยุด", UDim2.new(0.5, 6, 0, 351), UDim2.new(0.5, -20, 0, 36), COLORS.red)
-local clearButton = makeButton(panel, "ClearRoute", "ล้างเส้นทาง", UDim2.fromOffset(14, 393), UDim2.new(0.5, -20, 0, 30), COLORS.field)
-local avoidButton = makeButton(panel, "Avoid", "หลบสิ่งกีดขวาง: ON", UDim2.new(0.5, 6, 0, 393), UDim2.new(0.5, -20, 0, 30), COLORS.field)
-
-local statusLabel = makeLabel(panel, "Status", "สถานะ: พร้อมใช้งาน", UDim2.fromOffset(14, 429), UDim2.new(1, -28, 0, 22), 12, COLORS.yellow)
-local telemetryLabel = makeLabel(panel, "Telemetry", "ความเร็วจริง: 0 km/h   •   จุด: -", UDim2.fromOffset(14, 452), UDim2.new(1, -28, 0, 22), 11, COLORS.muted)
-
-local reopenButton = makeButton(gui, "Reopen", "AUTO", UDim2.fromOffset(12, 140), UDim2.fromOffset(72, 34), COLORS.accent)
-reopenButton.Visible = false
-
-local function setStatus(text, color)
-    lastStatus = text
-    statusLabel.Text = "สถานะ: " .. text
-    statusLabel.TextColor3 = color or COLORS.yellow
-end
-
-local function refreshRouteList()
-    if #waypoints == 0 then
-        routeBox.Text = "ยังไม่มีจุดหมาย  •  เพิ่มพิกัด X/Y/Z หรือบันทึกตำแหน่งรถ"
-        routeBox.TextColor3 = COLORS.muted
-        return
-    end
-
-    local lines = {}
-    local displayStart = math.max(1, #waypoints - 5)
-    for i = displayStart, #waypoints do
-        local point = waypoints[i]
-        local marker = (driving and i == waypointIndex) and "▶" or " "
-        table.insert(lines, string.format("%s %02d) X %.0f   Y %.0f   Z %.0f", marker, i, point.X, point.Y, point.Z))
-    end
-    if displayStart > 1 then
-        table.insert(lines, 1, string.format("... อีก %d จุด ...", displayStart - 1))
-    end
-    routeBox.Text = table.concat(lines, "\n")
-    routeBox.TextColor3 = COLORS.text
-end
-
-local function stopDriving(reason)
-    driving = false
-    releaseAutoInput()
-    if reason then
-        setStatus(reason, COLORS.yellow)
-    else
-        setStatus("หยุดแล้ว", COLORS.red)
-    end
-    refreshRouteList()
-end
-
-local function setSpeedFromX(x)
-    local startX = sliderTrack.AbsolutePosition.X
-    local width = math.max(sliderTrack.AbsoluteSize.X, 1)
-    local alpha = math.clamp((x - startX) / width, 0, 1)
-    desiredSpeedKmh = math.floor(MIN_SPEED_KMH + alpha * (MAX_SPEED_KMH - MIN_SPEED_KMH) + 0.5)
-    local snappedAlpha = (desiredSpeedKmh - MIN_SPEED_KMH) / (MAX_SPEED_KMH - MIN_SPEED_KMH)
-    sliderFill.Size = UDim2.new(snappedAlpha, 0, 1, 0)
-    sliderKnob.Position = UDim2.new(snappedAlpha, 0, 0.5, 0)
-    speedLabel.Text = tostring(desiredSpeedKmh) .. " km/h"
-end
-
-local function beginSliderDrag(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        draggingSlider = true
-        setSpeedFromX(input.Position.X)
-    end
-end
-
-sliderTrack.InputBegan:Connect(beginSliderDrag)
-sliderKnob.InputBegan:Connect(beginSliderDrag)
-
-UserInputService.InputChanged:Connect(function(input)
-    if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        setSpeedFromX(input.Position.X)
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        draggingSlider = false
-        dragPanel = false
-    end
-end)
-
--- Drag window (desktop + touch)
-header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragPanel = true
-        panelDragStart = input.Position
-        panelStartPosition = panel.Position
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input)
-    if dragPanel and panelDragStart and panelStartPosition and
-        (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - panelDragStart
-        panel.Position = UDim2.new(
-            panelStartPosition.X.Scale,
-            panelStartPosition.X.Offset + delta.X,
-            panelStartPosition.Y.Scale,
-            panelStartPosition.Y.Offset + delta.Y
-        )
-    end
-end)
-
-minimizeButton.Activated:Connect(function()
-    panel.Visible = false
-    reopenButton.Visible = true
-end)
-
-reopenButton.Activated:Connect(function()
-    panel.Visible = true
-    reopenButton.Visible = false
-    local targetPosition = panel.Position
-    panel.Position = targetPosition + UDim2.fromOffset(0, 12)
-    TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Position = targetPosition
-    }):Play()
-end)
-
-addPointButton.Activated:Connect(function()
-    if #waypoints >= MAX_WAYPOINTS then
-        setStatus("เพิ่มได้สูงสุด " .. MAX_WAYPOINTS .. " จุด", COLORS.red)
-        return
-    end
-
-    local x = tonumber(xInput.Text)
-    local y = tonumber(yInput.Text)
-    local z = tonumber(zInput.Text)
-    if not x or not y or not z then
-        setStatus("กรอก X, Y และ Z เป็นตัวเลขก่อน", COLORS.red)
-        return
-    end
-
-    table.insert(waypoints, Vector3.new(x, y, z))
-    xInput.Text = ""
-    yInput.Text = ""
-    zInput.Text = ""
-    refreshRouteList()
-    setStatus("เพิ่มจุดหมายที่ " .. #waypoints .. " แล้ว", COLORS.green)
-end)
-
-saveCurrentButton.Activated:Connect(function()
-    if #waypoints >= MAX_WAYPOINTS then
-        setStatus("เพิ่มได้สูงสุด " .. MAX_WAYPOINTS .. " จุด", COLORS.red)
-        return
-    end
-
-    local _, _, chassis = getCurrentScooter()
-    if not chassis then
-        setStatus("ต้องนั่งบนรถก่อนบันทึกตำแหน่ง", COLORS.red)
-        return
-    end
-
-    local p = chassis.Position
-    table.insert(waypoints, Vector3.new(p.X, p.Y, p.Z))
-    refreshRouteList()
-    setStatus("บันทึกตำแหน่งรถเป็นจุดที่ " .. #waypoints, COLORS.green)
-end)
-
-startButton.Activated:Connect(function()
-    if driving then
-        setStatus("กำลังขับอยู่แล้ว", COLORS.yellow)
-        return
-    end
-    if #waypoints == 0 then
-        setStatus("เพิ่มจุดหมายอย่างน้อย 1 จุดก่อน", COLORS.red)
-        return
-    end
-    local model, seat, chassis = getCurrentScooter()
-    if not model or not seat or not chassis then
-        setStatus("ต้องนั่งขับมอเตอร์ไซค์ก่อนเริ่ม", COLORS.red)
-        return
-    end
-
-    waypointIndex = 1
-    driving = true
-    setStatus("กำลังขับไปยังจุดที่ 1", COLORS.green)
-    refreshRouteList()
-end)
-
-stopButton.Activated:Connect(function()
-    stopDriving("หยุดโดยผู้ใช้")
-end)
-
-clearButton.Activated:Connect(function()
-    stopDriving("ล้างเส้นทางแล้ว")
-    table.clear(waypoints)
-    waypointIndex = 1
-    refreshRouteList()
-end)
-
-avoidButton.Activated:Connect(function()
-    avoidObstacles = not avoidObstacles
-    avoidButton.Text = avoidObstacles and "หลบสิ่งกีดขวาง: ON" or "หลบสิ่งกีดขวาง: OFF"
-    avoidButton.BackgroundColor3 = avoidObstacles and COLORS.field or Color3.fromRGB(77, 57, 43)
-    setStatus(avoidObstacles and "เปิดระบบช่วยหลบสิ่งกีดขวาง" or "ปิดระบบช่วยหลบสิ่งกีดขวาง", COLORS.yellow)
-end)
-
--- =========================
--- AUTODRIVE LOOP
--- =========================
-RunService.Heartbeat:Connect(function()
-    if not driving then
-        return
-    end
-
-    local model, seat, chassis = getCurrentScooter()
-    if not model or not seat or not chassis then
-        stopDriving("ไม่พบรถหรือไม่ได้อยู่บนเบาะคนขับ")
-        return
-    end
-
-    local target = waypoints[waypointIndex]
-    if not target then
-        stopDriving("ถึงจุดหมายครบแล้ว")
-        return
-    end
-
-    local delta = Vector3.new(target.X - chassis.Position.X, 0, target.Z - chassis.Position.Z)
-    local distance = delta.Magnitude
-    local velocity = chassis.AssemblyLinearVelocity
-    -- Match the game's own speed conversion: studs/s ÷ 3.571, then × 3.6 for km/h.
-    local forwardSpeed = math.abs(velocity:Dot(chassis.CFrame.LookVector))
-    lastActualSpeed = (forwardSpeed / 3.5714285714) * 3.6
-
-    if distance <= ARRIVE_DISTANCE then
-        waypointIndex += 1
-        refreshRouteList()
-        if waypointIndex > #waypoints then
-            stopDriving("ถึงจุดหมายครบแล้ว")
-            telemetryLabel.Text = string.format("ความเร็วจริง: %.0f km/h   •   จุด: เสร็จแล้ว", lastActualSpeed)
-            return
+    currentTween = {cancel = function() cancelled = true restore() end}
+    conn = RunService.Heartbeat:Connect(function(dt)
+        if cancelled or not mover.Parent then return restore() end
+        local cf = pivotOf(mover)
+        local delta = targetPos - cf.Position
+        local dist = delta.Magnitude
+        local step = speed * dt
+        -- ล้างแรงเพื่อไม่ให้ฟิสิกส์ดึงกลับ
+        for _, p in ipairs(mover:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.AssemblyLinearVelocity = Vector3.zero
+                p.AssemblyAngularVelocity = Vector3.zero
+            end
         end
-        target = waypoints[waypointIndex]
-        delta = Vector3.new(target.X - chassis.Position.X, 0, target.Z - chassis.Position.Z)
-        distance = delta.Magnitude
-        setStatus("กำลังขับไปยังจุดที่ " .. waypointIndex, COLORS.green)
+        if dist <= step then
+            mover:PivotTo(CFrame.new(targetPos) * (cf - cf.Position))
+            restore(); currentTween = nil
+            WindUI:Notify({Title="ถึงแล้ว", Content="Teleport สำเร็จ", Duration=2})
+        else
+            mover:PivotTo(cf + delta.Unit * step)
+        end
+    end)
+end
+
+-- ===== หาเป้าหมาย =====
+local function raceTargets()
+    local list = {}
+    local ok, races = pcall(function() return RS:WaitForChild("RaceState",3):WaitForChild("Races",3) end)
+    if not ok or not races then return list end
+    for _, r in ipairs(races:GetChildren()) do
+        local okj, cps = pcall(HttpService.JSONDecode, HttpService, r:GetAttribute("Checkpoints") or "[]")
+        local c = okj and cps and cps[1]
+        if c then
+            table.insert(list, {
+                name = (r:GetAttribute("Title") or r.Name),
+                prize = r:GetAttribute("Prize") or 0,
+                pos = Vector3.new(c[1], c[2] + heightOffset, c[3]),
+            })
+        end
     end
+    table.sort(list, function(a,b) return a.prize > b.prize end)
+    return list
+end
 
-    local steer, angle = steerToward(chassis, target)
-    -- ใช้ค่าความเร็วที่ผู้ใช้ตั้งเป็นเป้าหมายโดยตรง
-    -- ระบบฟิสิกส์ของรถยังอาจทำให้ความเร็วจริงต่ำกว่าค่านี้ได้
-    local targetSpeed = desiredSpeedKmh
-    local absAngle = math.abs(angle)
-    if absAngle > math.rad(75) then
-        targetSpeed = math.min(targetSpeed, 22)
-    elseif absAngle > math.rad(42) then
-        targetSpeed = math.min(targetSpeed, desiredSpeedKmh * 0.6)
+local function partyDrop()
+    local f = workspace:FindFirstChild("PartyDrops")
+    if not f then return end
+    for _, d in ipairs(f:GetChildren()) do
+        if d:IsA("BasePart") and d:GetAttribute("C"..lp.UserId) ~= true then
+            return d.Position + Vector3.new(0, 2, 0)
+        end
     end
-    if distance < 40 then
-        targetSpeed = math.min(targetSpeed, math.max(10, distance * 1.2))
+end
+
+local function resolve(choice)
+    if choice == "Party Drop (ของขวัญสายรุ้ง)" then
+        local p = partyDrop()
+        if p then return p, "Party Drop" end
+        return nil, "ตอนนี้ไม่มี Party Drop"
     end
-    if distance < ARRIVE_DISTANCE * 2 then
-        targetSpeed = math.min(targetSpeed, 12)
+    local races = raceTargets()
+    if choice == "Best Race (Prize สูงสุด)" then
+        if races[1] then return races[1].pos, races[1].name.."  $"..races[1].prize end
+        return nil, "ไม่พบ Race"
     end
-
-    local throttle = getThrottleForSpeed(targetSpeed, lastActualSpeed)
-    steer, throttle = (function()
-        local adjustedSteer, adjustedThrottle = avoidObstacle(model, chassis, steer, throttle, lastActualSpeed, angle)
-        return adjustedSteer, adjustedThrottle
-    end)()
-
-    -- Use original game's input layer rather than forcing the chassis CFrame.
-    TouchControls.throttle = math.clamp(throttle, -1, 1)
-    TouchControls.steer = math.clamp(steer, -1, 1)
-
-    telemetryLabel.Text = string.format(
-        "ความเร็วจริง: %.0f km/h   •   จุด: %d/%d",
-        lastActualSpeed,
-        waypointIndex,
-        #waypoints
-    )
-end)
-
-player.CharacterAdded:Connect(function()
-    if driving then
-        stopDriving("ตัวละครเกิดใหม่ จึงหยุดระบบอัตโนมัติ")
-    else
-        releaseAutoInput()
+    for _, r in ipairs(races) do
+        if choice == r.name.."  $"..r.prize then return r.pos, r.name end
     end
-end)
+    return nil, "ไม่พบเป้าหมาย"
+end
 
-refreshRouteList()
-setStatus("พร้อมใช้งาน • เพิ่มจุดหมายก่อนเริ่ม", COLORS.yellow)
+local function buildOptions()
+    local opts = {"Best Race (Prize สูงสุด)", "Party Drop (ของขวัญสายรุ้ง)"}
+    for _, r in ipairs(raceTargets()) do table.insert(opts, r.name.."  $"..r.prize) end
+    return opts
+end
 
--- Panel entrance animation
-panel.BackgroundTransparency = 1
-TweenService:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-    BackgroundTransparency = 0
-}):Play()
+-- ===== UI =====
+local Window = WindUI:CreateWindow({
+    Title = "Bike Universe",
+    Icon = "bike",
+    Author = "Money Spot TP",
+    Folder = "BikeUniverseTP",
+})
+
+local Tab = Window:Tab({Title = "Teleport", Icon = "map-pin"})
+
+local dd = Tab:Dropdown({
+    Title = "เลือกจุด",
+    Values = buildOptions(),
+    Value = selected,
+    Callback = function(v) selected = v end,
+})
+
+Tab:Slider({
+    Title = "ความเร็ว (studs/s)",
+    Value = {Min = 20, Max = 1500, Default = speed},
+    Step = 10,
+    Callback = function(v) speed = v end,
+})
+
+Tab:Slider({
+    Title = "ความสูงเหนือจุด",
+    Value = {Min = 0, Max = 30, Default = heightOffset},
+    Step = 1,
+    Callback = function(v) heightOffset = v end,
+})
+
+Tab:Button({
+    Title = "ไปเลย (Tween)",
+    Callback = function()
+        local pos, label = resolve(selected)
+        if not pos then return WindUI:Notify({Title="ไม่พบจุด", Content=label, Duration=3}) end
+        WindUI:Notify({Title="กำลังไป", Content=label, Duration=2})
+        flyTo(pos)
+    end,
+})
+
+Tab:Button({
+    Title = "หยุด",
+    Callback = stopTween,
+})
+
+Tab:Button({
+    Title = "รีเฟรชรายการ",
+    Callback = function()
+        if dd.Refresh then dd:Refresh(buildOptions()) end
+    end,
+})
