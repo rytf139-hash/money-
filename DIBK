@@ -7,7 +7,7 @@ local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local lp = Players.LocalPlayer
 
-local speed = 150        -- studs/วินาที
+local speed = 500        -- studs/วินาที
 local heightOffset = 6
 local currentTween      -- {cancel=function}
 local selected = "Best Race (Prize สูงสุด)"
