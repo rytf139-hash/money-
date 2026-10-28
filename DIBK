@@ -7,7 +7,7 @@ local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local lp = Players.LocalPlayer
 
-local speed = 500        -- studs/วินาที
+local speed = 150        -- studs/วินาที
 local heightOffset = 6
 local currentTween      -- {cancel=function}
 local selected = "Best Race (Prize สูงสุด)"
@@ -96,7 +96,30 @@ local function partyDrop()
     end
 end
 
+-- อุโมงค์ทางด่วน (LongHighway): อ่านพิกัดจาก attribute ของเกม แล้วยิง raycast หาพื้นถนน
+local function tunnelPos(which)
+    local hw = workspace:FindFirstChild("LongHighway")
+    if not hw then return nil, "ไม่พบ LongHighway" end
+    local sx, ex = hw:GetAttribute("StartX"), hw:GetAttribute("EndX")
+    if not (sx and ex) then return nil, "LongHighway ไม่มีค่า StartX/EndX" end
+    local half = hw:GetAttribute("LoopTunnelHalf") or 300
+    local z = hw:GetAttribute("CenterZ") or 0
+    local x
+    if which == "start" then x = sx + half * 0.5
+    elseif which == "end" then x = ex - half * 0.5
+    else x = (sx + ex) / 2 end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {lp.Character}
+    local hit = workspace:Raycast(Vector3.new(x, 380, z), Vector3.new(0, -500, 0), params)
+    local y = hit and hit.Position.Y or 20
+    return Vector3.new(x, y + heightOffset, z), "อุโมงค์ ("..which..")"
+end
+
 local function resolve(choice)
+    if choice == "อุโมงค์ ต้นทาง" then return tunnelPos("start") end
+    if choice == "อุโมงค์ ปลายทาง" then return tunnelPos("end") end
+    if choice == "กลางทางด่วน" then return tunnelPos("mid") end
     if choice == "Party Drop (ของขวัญสายรุ้ง)" then
         local p = partyDrop()
         if p then return p, "Party Drop" end
@@ -114,7 +137,7 @@ local function resolve(choice)
 end
 
 local function buildOptions()
-    local opts = {"Best Race (Prize สูงสุด)", "Party Drop (ของขวัญสายรุ้ง)"}
+    local opts = {"Best Race (Prize สูงสุด)", "Party Drop (ของขวัญสายรุ้ง)", "อุโมงค์ ต้นทาง", "อุโมงค์ ปลายทาง", "กลางทางด่วน"}
     for _, r in ipairs(raceTargets()) do table.insert(opts, r.name.."  $"..r.prize) end
     return opts
 end
