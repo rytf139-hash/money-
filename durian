@@ -1,5 +1,5 @@
 --[[
-	🌾 สวนทุเรียน HUB  •  Durian Farm Hub  v1.0
+	🌾 สวนทุเรียน HUB  •  Durian Farm Hub  v1.1  (anti-kick build)
 	────────────────────────────────────────────────
 	สคริปต์ออโต้ + UI สไตล์เดียวกับในเกม (โทนม่วง/เขียว, tween เด้งนุ่ม ๆ)
 	ออกแบบให้ "มือถือกดง่าย" : ปุ่มใหญ่ 46px+, ลากหน้าต่างได้, ปุ่มลอยย่อ/ขยาย,
@@ -18,6 +18,19 @@
 	  ⚡ ผู้เล่น   : WalkSpeed, JumpPower, Fly, NoClip, Infinite Jump, ออโต้หยิบอุปกรณ์
 	  ⚙️ ตั้งค่า   : ขนาด UI, สีธีม, ความเร็ว tween, บันทึก/โหลด, ลบสคริปต์, log
 
+	v1.1 แก้อะไร (หลังเจอเตะ "Kicked by the anti-cheat: jump height 12" / code 267):
+	  • เกมนี้ "client เป็นคนรายงานค่าให้เซิร์ฟเวอร์เอง" (CharacterSync → Remotes.MovementSync)
+	    - walk speed  : เตะเมื่อ WalkSpeed > StarterPlayer.CharacterWalkSpeed*2 + 2 (ค้าง 1.5 วิ)
+	    - jump height : เตะเมื่อ jump จริง > StarterPlayer.CharacterJumpHeight + 1 (ค้าง 1.5 วิ)
+	    - mover       : เตะทันทีถ้ามี BodyVelocity/BodyGyro/LinearVelocity/VectorForce/... เกาะตัวละคร
+	    - flying      : เตะเมื่อลอยโดย AssemblyLinearVelocity.Y > -4 นาน 6 วิ
+	  • ดังนั้น v1.1:
+	    - ไม่แตะ JumpPower/JumpHeight เลย เว้นแต่เปิด "override" เอง (ค่าเดิม: คืนค่าเกมตลอด)
+	    - ล็อค WalkSpeed ไม่ให้เกินลิมิตเกม (โหมด "กันเตะ" เปิดเป็นค่าเริ่มต้น)
+	    - Fly ใหม่: ไม่สร้าง force/constraint แม้แต่ตัวเดียว (กัน mover kick)
+	      บินด้วยการเลื่อน CFrame + "ย่อตัว (dip)" ทุกไม่กี่วิเพื่อรีเซ็ตตัวนับ flying
+	    - ปุ่มบูสต์กระโดดถูกกันด้วยโหมดกันเตะ
+
 	หมายเหตุ: ใช้เพื่อความบันเทิง/ทดสอบ ระวังผิดกฎ Roblox และอาจโดนแบนไอดีได้
 --]]
 
@@ -32,7 +45,7 @@ end
 
 local HUB = {}
 Global.__DURIAN_HUB = HUB
-HUB.Version   = "1.0.0"
+HUB.Version   = "1.1.0"
 HUB.Alive     = true
 HUB.Name      = "สวนทุเรียน HUB"
 HUB.Conns     = {}   -- connections ทั้งหมด (ไว้ disconnect ตอน destroy)
@@ -135,7 +148,8 @@ local State = {
 	esp = { fruit = false, plot = false, npc = false, vehicle = false, player = false, chest = false, pond = false, distance = true },
 	playerMods = {
 		fly = false, flySpeed = 60, noClip = false, infJump = false, lockStats = false,
-		walkSpeed = 16, jumpPower = 50, autoEquipCan = false, autoEquipRod = false,
+		walkSpeed = 16, jumpPower = 7.2, autoEquipCan = false, autoEquipRod = false,
+		safeMode = true, jumpOverride = false, flyDip = true, dipEvery = 4,
 	},
 	teleport = { saved = {} },
 }
@@ -2125,14 +2139,53 @@ Mods.upHeld, Mods.downHeld = false, false
 Mods.flyParts = {}
 Mods.savedSpeed = nil
 
+-- อ่านลิมิตที่ "เกมอนุญาต" จาก StarterPlayer (ค่าที่ anti-cheat ใช้ตรวจ)
+Mods.limits = { walkBase = 16, walkMax = 33.5, jumpBase = 7.2, origJumpPower = nil, origJumpHeight = nil, ready = false }
+function Mods.readLimits()
+	local sp = game:GetService("StarterPlayer")
+	local wb = tonumber(sp and sp.CharacterWalkSpeed) or 16
+	local jb = tonumber(sp and sp.CharacterJumpHeight) or 7.2
+	Mods.limits.walkBase = wb
+	Mods.limits.walkMax = wb * 2 + 1.5   -- เกมเตะที่ base*2 + 2 → เหลือเผื่อ 0.5
+	Mods.limits.jumpBase = jb
+	local hum = World.hum()
+	if hum and not Mods.limits.ready then
+		Mods.limits.origJumpPower = tonumber(hum.JumpPower) or 50
+		Mods.limits.origJumpHeight = tonumber(hum.JumpHeight) or jb
+		Mods.limits.useJumpPower = hum.UseJumpPower and true or false
+		Mods.limits.ready = true
+	end
+	return Mods.limits
+end
+
 function Mods.applyStats()
 	local hum = World.hum()
 	if not hum then return end
-	pcall(function() hum.WalkSpeed = State.playerMods.walkSpeed end)
-	pcall(function()
-		if hum.UseJumpPower then hum.JumpPower = State.playerMods.jumpPower
-		else hum.JumpHeight = State.playerMods.jumpPower / 4 end
-	end)
+	local lim = Mods.readLimits()
+	-- ความเร็วเดิน: ถ้าเปิดกันเตะ จะคลำเพดานที่เกมอนุญาตให้เอง
+	local walk = tonumber(State.playerMods.walkSpeed) or lim.walkBase
+	if State.playerMods.safeMode then walk = math.min(walk, lim.walkMax) end
+	pcall(function() hum.WalkSpeed = walk end)
+	-- กระโดด: "ห้ามแตะ" เว้นแต่ผู้ใช้เปิด override เอง และปิดกันเตะ
+	if State.playerMods.jumpOverride and not State.playerMods.safeMode then
+		local h = clamp(tonumber(State.playerMods.jumpPower) or lim.jumpBase, 2, 60)
+		pcall(function()
+			if hum.UseJumpPower then
+				hum.JumpPower = math.sqrt(2 * (Workspace.Gravity or 196.2) * h)
+			else
+				hum.JumpHeight = h
+			end
+		end)
+	else
+		-- คืนค่าเดิมของเกมเสมอ → anti-cheat ตรวจ jump height ไม่ผ่าน
+		pcall(function()
+			if hum.UseJumpPower then
+				hum.JumpPower = lim.origJumpPower or 50
+			else
+				hum.JumpHeight = lim.origJumpHeight or lim.jumpBase
+			end
+		end)
+	end
 end
 
 function Mods.statLoop()
@@ -2148,58 +2201,53 @@ function Mods.statLoop()
 	end))
 end
 
--- ── Fly ──
+-- ── Fly (v1.1: ไม่สร้าง force/constraint เลย กัน anti-cheat "mover") ──
 function Mods.startFly()
 	local hrp = World.hrp()
 	if not hrp then HUB.Notify("ยังไม่พร้อม (ไม่มีตัวละคร)", "warn") return false end
 	Mods.stopFly(true)
-	local att = new("Attachment", { Name = "HubFlyAtt" }, hrp)
-	local velObj = nil
-	local okLV, lv = pcall(function()
-		local v = Instance.new("LinearVelocity")
-		v.Attachment0 = att
-		v.MaxForce = math.huge
-		v.RelativeTo = Enum.ActuatorRelativeTo.World
-		v.VectorVelocity = Vector3.new(0, 0, 0)
-		v.Parent = hrp
-		return v
-	end)
-	if okLV and lv then
-		velObj = lv
-	else
-		local okBV, bv = pcall(function()
-			local b = Instance.new("BodyVelocity")
-			b.MaxForce = Vector3.new(1e6, 1e6, 1e6)
-			b.P = 1e4
-			b.Velocity = Vector3.new(0, 0, 0)
-			b.Parent = hrp
-			return b
-		end)
-		if okBV then velObj = bv end
-	end
-	Mods.flyParts = { att = att, vel = velObj, isLV = (velObj == lv) }
-	Mods.flyConn = track(RunService.RenderStepped:Connect(function()
+	Mods.flyState = { lastDip = os.clock(), dipping = false, dipT0 = 0 }
+	Mods.flyConn = track(RunService.RenderStepped:Connect(function(dt)
 		if not State.playerMods.fly then return end
 		local h = World.hrp()
 		if not h then return end
+		dt = math.min(tonumber(dt) or 0.016, 0.05)
 		local hum = World.hum()
 		local md = (hum and hum.MoveDirection) or Vector3.new(0, 0, 0)
-		local spd = State.playerMods.flySpeed
+		local spd = tonumber(State.playerMods.flySpeed) or 60
 		local dir = Vector3.new(md.X, 0, md.Z)
 		if dir.Magnitude > 1 then dir = dir.Unit end
 		local up = (Mods.upHeld and 1 or 0) - (Mods.downHeld and 1 or 0)
-		local target = dir * spd + Vector3.new(0, up * spd, 0)
-		local v = Mods.flyParts.vel
-		if v and v.Parent then
-			if Mods.flyParts.isLV then v.VectorVelocity = target else v.Velocity = target end
-		else
-			pcall(function() h.AssemblyLinearVelocity = target end)
+		local st = Mods.flyState
+		local now = os.clock()
+
+		-- dip: ทิ้งตัวลงเร็ว ๆ (Y <= -4) เป็นช่วงสั้น ๆ เพื่อรีเซ็ตตัวนับ "flying" ของเกม
+		if State.playerMods.flyDip then
+			if st.dipping then
+				if now - st.dipT0 > 0.26 then
+					st.dipping = false
+					st.lastDip = now
+				end
+			elseif now - st.lastDip > math.max(1.5, tonumber(State.playerMods.dipEvery) or 4) then
+				st.dipping = true
+				st.dipT0 = now
+			end
 		end
+		if st.dipping then
+			pcall(function() h.AssemblyLinearVelocity = Vector3.new(0, -14, 0) end)
+			pcall(function() h.CFrame = h.CFrame + Vector3.new(0, -14 * dt, 0) end)
+			return
+		end
+
+		-- บินด้วยการเลื่อน CFrame ตรง ๆ (ไม่ใช้ BodyVelocity/LinearVelocity → ไม่โดน mover kick)
+		local move = (dir * spd + Vector3.new(0, up * spd, 0)) * dt
+		pcall(function() h.CFrame = h.CFrame + move end)
+		pcall(function() h.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
 	end))
 	State.playerMods.fly = true
 	if UI.FlyPad then UI.FlyPad.Visible = true end
-	UI.setStatus("🕊️ Fly เปิดอยู่ (ใช้ปุ่ม ▲▼ บินขึ้น/ลง)", "#7fd4ff")
-	HUB.Notify("เปิด Fly แล้ว", "ok")
+	UI.setStatus("🕊️ Fly (โหมดกันเตะ: บินด้วย CFrame + dip)", "#7fd4ff")
+	HUB.Notify("เปิด Fly แล้ว — จะย่อตัวลงทุก " .. tostring(State.playerMods.dipEvery) .. " วิเพื่อกันตรวจ flying", "ok")
 	return true
 end
 
@@ -2211,6 +2259,7 @@ function Mods.stopFly(silent)
 		if o and o.Parent then o:Destroy() end
 	end
 	Mods.flyParts = {}
+	Mods.flyState = nil
 	local hrp = World.hrp()
 	if hrp then pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end) end
 	if UI.FlyPad then UI.FlyPad.Visible = false end
@@ -2367,6 +2416,16 @@ function Config.load()
 			end
 		end
 	end
+	-- sanitize ค่าเก่า (v1.0) ที่อาจทำให้โดนเตะ
+	if State.playerMods.safeMode then
+		local lim = Mods.readLimits()
+		State.playerMods.walkSpeed = clamp(tonumber(State.playerMods.walkSpeed) or 16, 8, lim.walkMax)
+	end
+	if State.playerMods.jumpOverride == nil then State.playerMods.jumpOverride = false end
+	if State.playerMods.safeMode == nil then State.playerMods.safeMode = true end
+	if State.playerMods.flyDip == nil then State.playerMods.flyDip = true end
+	State.playerMods.jumpPower = clamp(tonumber(State.playerMods.jumpPower) or 7.2, 2, 60)
+
 	if type(data.saved) == "table" then
 		State.teleport.saved = {}
 		for _, s in ipairs(data.saved) do
@@ -2738,16 +2797,48 @@ end
 -- ─────────────── TAB 6 : ผู้เล่น ───────────────
 local function buildPlayerTab()
 	local page = UI.addTab("player", "⚡", "ผู้เล่น")
+	local lim = Mods.readLimits()
+
+	W.section(page, "🛡 กันเตะ (anti-kick)")
+	W.toggle(page, { name = "โหมดกันเตะ (แนะนำ: เปิด)", icon = "🛡",
+		desc = "ล็อค WalkSpeed ไม่เกิน " .. math.floor(lim.walkMax) .. " และไม่แตะค่ากระโดดเด็ดขาด (เกมนี้รายงานค่าให้เซิร์ฟเวอร์เอง)",
+		default = State.playerMods.safeMode,
+		callback = function(v)
+			State.playerMods.safeMode = v
+			Mods.applyStats()
+			HUB.Notify(v and "เปิดโหมดกันเตะ — ค่าตัวละครจะถูกคุมให้อยู่ในลิมิตเกม" or "ปิดโหมดกันเตะ — เสี่ยงโดนเตะ 267", v and "ok" or "warn")
+			Config.save()
+		end })
+	local limLabel = W.label(page, "", { bg = Theme.track, height = 46, color = Theme.muted, size = 11 })
+	limLabel.Text = string.format(
+		'<font color="#9be86a">เกมอนุญาต:</font> เดิน ≤ <font color="#ffd45e">%d</font>  •  กระโดด = <font color="#ffd45e">%.1f</font> stud\n<font color="#ff9c9c">เกินกว่านี้ = โดนเตะ (walk speed / jump height / flying / mover)</font>',
+		math.floor(lim.walkMax), lim.jumpBase)
+	W.toggle(page, { name = "Override ค่ากระโดด (เสี่ยง)", icon = "🦘",
+		desc = "ปิดกันเตะก่อนถึงจะใช้ได้ — เกมตรวจ JumpHeight/JumpPower จาก client ตรง ๆ",
+		default = State.playerMods.jumpOverride,
+		callback = function(v)
+			State.playerMods.jumpOverride = v
+			Mods.applyStats()
+			if v then HUB.Notify("เปิด override กระโดดแล้ว — มีผลเมื่อปิดโหมดกันเตะเท่านั้น (เสี่ยงโดนเตะ)", "warn") end
+			Config.save()
+		end })
+	W.toggle(page, { name = "ย่อตัวกันตรวจ flying ตอนบิน", icon = "🪂",
+		desc = "ทิ้งตัวลงเร็ว ๆ ทุก X วิ เพื่อรีเซ็ตตัวนับ 'flying' ของ anti-cheat",
+		default = State.playerMods.flyDip, callback = function(v) State.playerMods.flyDip = v Config.save() end })
+	W.slider(page, { name = "ระยะห่างระหว่าง dip", icon = "⏱️", min = 2, max = 8, decimals = 1,
+		default = State.playerMods.dipEvery, suffix = " s", callback = function(v) State.playerMods.dipEvery = v Config.save() end })
+
 	W.section(page, "ค่าตัวละคร")
 	W.slider(page, { name = "ความเร็วเดิน", icon = "🏃", min = 8, max = 300, default = State.playerMods.walkSpeed,
-		callback = function(v) State.playerMods.walkSpeed = v Mods.applyStats() Config.save() end })
-	W.slider(page, { name = "แรงกระโดด", icon = "🦘", min = 0, max = 300, default = State.playerMods.jumpPower,
+		desc = nil, callback = function(v) State.playerMods.walkSpeed = v Mods.applyStats() Config.save() end })
+	W.slider(page, { name = "แรงกระโดด (stud)", icon = "🦘", min = 2, max = 40, decimals = 1,
+		default = clamp(tonumber(State.playerMods.jumpPower) or lim.jumpBase, 2, 40),
 		callback = function(v) State.playerMods.jumpPower = v Mods.applyStats() Config.save() end })
 	W.toggle(page, { name = "ล็อคค่า (กันเกมรีเซ็ต)", icon = "🔒", desc = "ตั้งค่าซ้ำทุก 0.5 วิ",
 		default = State.playerMods.lockStats, callback = function(v) State.playerMods.lockStats = v Config.save() end })
 
 	W.section(page, "การบิน / ทะลุสิ่งของ")
-	W.toggle(page, { name = "Fly (บิน)", icon = "🕊️", desc = "มือถือใช้ปุ่ม ▲▼ ด้านขวาจอ",
+	W.toggle(page, { name = "Fly (บิน)", icon = "🕊️", desc = "v1.1: บินด้วย CFrame (ไม่ใช้ force) + มือถือมีปุ่ม ▲▼",
 		default = State.playerMods.fly,
 		callback = function(v)
 			if v then Mods.startFly() else Mods.stopFly() end
@@ -2780,9 +2871,15 @@ local function buildPlayerTab()
 		HUB.Notify("รีเซ็ตค่าตัวละครแล้ว", "ok")
 	end, nil, Theme.off, Color3.fromRGB(50, 50, 60))
 	listButton(pbtns, "เด้งไปจุดเกิด", "🌍", function() TP.spawn() end, nil, Theme.purple, Theme.purpleDark)
-	listButton(pbtns, "กระโดดขึ้นฟ้า 1 ครั้ง", "🚀", function()
+	W.label(page, "⚠️ เกมนี้มี anti-cheat ฝั่ง client ที่รายงาน: walk speed / jump height / flying / mover(-force)\n"
+		.. "NoClip + วาร์ป มักปลอดภัยกว่า Fly — ถ้ายังโดนเตะ ให้ปิด Fly แล้วใช้วาร์ปแทน", { bg = Theme.track, height = 46, color = Theme.muted, size = 11 })
+	listButton(pbtns, "บูสต์กระโดด 1 ครั้ง", "🚀", function()
+		if State.playerMods.safeMode then
+			HUB.Notify("โหมดกันเตะกันปุ่มนี้ไว้ — ปิดโหมดกันเตะก่อนถ้าอยากใช้", "warn")
+			return
+		end
 		local hrp = World.hrp()
-		if hrp then pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 120, 0) end) end
+		if hrp then pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 80, 0) end) end
 	end, nil, Theme.gold, Color3.fromRGB(150, 110, 20))
 	return page
 end
@@ -2905,6 +3002,7 @@ local function init()
 			end
 		end))
 
+		Mods.readLimits()
 		Mods.wireFlyButtons()
 		Mods.wireInfJump()
 		Mods.applyStats()
@@ -2957,7 +3055,8 @@ local function init()
 			.. " / " .. (HUB.Remote("Rebirth", 2) and "Rebirth ✓" or "Rebirth ✗"))
 		local base = World.myBase()
 		HUB.Log("สวนของเรา: " .. (base and base.Name or "ยังไม่พบ (อาจยังไม่ได้รับแปลง)"))
-		HUB.Notify("🌾 " .. HUB.Name .. " พร้อมใช้งาน!", "ok")
+		HUB.Notify("🌾 " .. HUB.Name .. " v" .. HUB.Version .. " พร้อมใช้งาน!", "ok")
+		HUB.Notify("🛡 โหมดกันเตะเปิดอยู่: เดินได้ ≤ " .. math.floor(Mods.limits.walkMax) .. " , ไม่แตะค่ากระโดด", "info")
 		HUB.Notify("กดปุ่มลอย 🌾 เพื่อเปิด/ปิด  •  ลากแถบหัวเพื่อย้ายหน้าต่าง", "info")
 	end)
 	if not ok then
