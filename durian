@@ -1,0 +1,2971 @@
+--[[
+	🌾 สวนทุเรียน HUB  •  Durian Farm Hub  v1.0
+	────────────────────────────────────────────────
+	สคริปต์ออโต้ + UI สไตล์เดียวกับในเกม (โทนม่วง/เขียว, tween เด้งนุ่ม ๆ)
+	ออกแบบให้ "มือถือกดง่าย" : ปุ่มใหญ่ 46px+, ลากหน้าต่างได้, ปุ่มลอยย่อ/ขยาย,
+	รองรับ safe-area (ติ่งจอ), มี Fly ปุ่มขึ้น/ลงบนจอ, บันทึกการตั้งค่าอัตโนมัติ
+
+	รองรับ: Delta / Arceus X / Hydrogen (มือถือ) และ Wave / Solara (PC)
+	เขียนด้วย Lua 5.1 + Roblox API ล้วน (ไม่ใช้ hookmetamethod / getrawmetatable)
+
+	ระบบที่มี:
+	  🌾 ฟาร์ม    : เก็บเกี่ยวอัตโนมัติ, รดน้ำ, เติมน้ำที่บ่อ, ขายขึ้นรถ, ขายที่แผง,
+	               Rebirth อัตโนมัติ, รับทุเรียนร่วง (Catch), วางของที่ถือ
+	  🎣 ตกปลา    : Auto Cast / Auto Hook / Auto Reel, เลือกเหยื่อ, วาร์ปไปบ่อ
+	  🎁 รางวัล    : ClaimDaily, Spin, SupremeSpin, ClaimGroup, ClaimPlay + ออโต้เคลม
+	  👁 ESP      : ผลสุก, แปลงปลูก, NPC, รถ, ผู้เล่น, หีบ (Highlight + ป้ายระยะ)
+	  🧭 วาร์ป    : สวนฉัน, บ่อน้ำ, บ่อปลา, รถ, จุดเกิด + สแกนหาจุดในแมพอัตโนมัติ
+	  ⚡ ผู้เล่น   : WalkSpeed, JumpPower, Fly, NoClip, Infinite Jump, ออโต้หยิบอุปกรณ์
+	  ⚙️ ตั้งค่า   : ขนาด UI, สีธีม, ความเร็ว tween, บันทึก/โหลด, ลบสคริปต์, log
+
+	หมายเหตุ: ใช้เพื่อความบันเทิง/ทดสอบ ระวังผิดกฎ Roblox และอาจโดนแบนไอดีได้
+--]]
+
+-- ══════════════════════════════════════════════════════════════
+--  0) BOOTSTRAP  (กันรันซ้ำ / ทำลายตัวเก่า)
+-- ══════════════════════════════════════════════════════════════
+local Global = (typeof(getgenv) == "function" and getgenv()) or _G
+if Global.__DURIAN_HUB and type(Global.__DURIAN_HUB) == "table" then
+	pcall(function() Global.__DURIAN_HUB.Destroy("โหลดสคริปต์ใหม่") end)
+	task.wait(0.15)
+end
+
+local HUB = {}
+Global.__DURIAN_HUB = HUB
+HUB.Version   = "1.0.0"
+HUB.Alive     = true
+HUB.Name      = "สวนทุเรียน HUB"
+HUB.Conns     = {}   -- connections ทั้งหมด (ไว้ disconnect ตอน destroy)
+HUB.Threads   = {}   -- loop flags
+HUB.LogLines  = {}
+
+local function track(conn) table.insert(HUB.Conns, conn) return conn end
+
+-- ══════════════════════════════════════════════════════════════
+--  1) SERVICES + ค่าคงที่
+-- ══════════════════════════════════════════════════════════════
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local RunService        = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local GuiService        = game:GetService("GuiService")
+local HttpService       = game:GetService("HttpService")
+local Debris            = game:GetService("Debris")
+local Workspace         = game:GetService("Workspace")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local camera    = Workspace.CurrentCamera
+
+-- fallback สำหรับ executor ที่ไม่มี math.clamp / table.find
+local clamp = math.clamp or function(v, lo, hi)
+	if v ~= v then return lo end
+	if v < lo then return lo elseif v > hi then return hi end
+	return v
+end
+local function tFind(list, value)
+	if table.find then return table.find(list, value) end
+	for i = 1, #list do if list[i] == value then return i end end
+	return nil
+end
+
+-- ตรวจจับแพลตฟอร์ม (สไตล์ UIPlatform ของเกม)
+local function detectPlatform()
+	local ok, inset = pcall(function() return GuiService:IsTenFootInterface() end)
+	if ok and inset then return "Console" end
+	if UserInputService.TouchEnabled then
+		local vp = (camera and camera.ViewportSize) or Vector2.new(1366, 768)
+		if math.min(vp.X, vp.Y) < 600 then return "Phone" end
+		if not UserInputService.MouseEnabled then return "Tablet" end
+	end
+	return "PC"
+end
+HUB.Platform = detectPlatform()
+HUB.IsTouch  = (HUB.Platform == "Phone" or HUB.Platform == "Tablet")
+
+-- ══════════════════════════════════════════════════════════════
+--  2) THEME  (ดึงโทนสีมาจาก UIKit/Controller ของเกมจริง)
+-- ══════════════════════════════════════════════════════════════
+local Theme = {
+	ink        = Color3.fromRGB(22, 22, 28),
+	body       = Color3.fromRGB(38, 36, 46),
+	row        = Color3.fromRGB(26, 25, 33),
+	rowAlt     = Color3.fromRGB(32, 30, 40),
+	text       = Color3.fromRGB(245, 245, 248),
+	muted      = Color3.fromRGB(165, 160, 180),
+	purple     = Color3.fromRGB(150, 80, 230),
+	purpleDark = Color3.fromRGB(88, 40, 150),
+	green      = Color3.fromRGB(95, 225, 45),
+	red        = Color3.fromRGB(215, 25, 25),
+	gold       = Color3.fromRGB(255, 205, 60),
+	off        = Color3.fromRGB(90, 90, 100),
+	track      = Color3.fromRGB(16, 16, 20),
+}
+local Accents = {
+	{ id = "purple", name = "ม่วง (เกม)",   color = Color3.fromRGB(150, 80, 230), dark = Color3.fromRGB(88, 40, 150) },
+	{ id = "green",  name = "เขียวทุเรียน", color = Color3.fromRGB(95, 225, 45),  dark = Color3.fromRGB(40, 120, 30) },
+	{ id = "gold",   name = "ทอง",          color = Color3.fromRGB(255, 205, 60), dark = Color3.fromRGB(150, 110, 20) },
+	{ id = "blue",   name = "ฟ้า",          color = Color3.fromRGB(64, 168, 255), dark = Color3.fromRGB(25, 90, 160) },
+	{ id = "pink",   name = "ชมพู",         color = Color3.fromRGB(255, 105, 180),dark = Color3.fromRGB(150, 40, 100) },
+}
+HUB.Accent    = Accents[1].color
+HUB.AccentDk  = Accents[1].dark
+
+-- ══════════════════════════════════════════════════════════════
+--  3) STATE / CONFIG
+-- ══════════════════════════════════════════════════════════════
+local State = {
+	ui = {
+		scale = 1, tweenSpeed = 1, accent = "purple",
+		notify = true, sound = false, autoSave = true, logOpen = false,
+	},
+	farm = {
+		master = false, harvest = true, water = true, refill = true,
+		sellTruck = true, sellStall = false, rebirth = false, autoCatch = true,
+		onlyMine = true, tpToTarget = true, reachDist = 32, standDist = 6,
+		harvestDelay = 0.25, waterDelay = 0.6, cycleDelay = 1.5, rebirthEvery = 20,
+	},
+	fish = {
+		auto = false, autoCast = true, autoHook = true, autoReel = true,
+		tpToPond = true, baitAuto = true, bait = "Worm", castDelay = 1.2, reelWait = 0.8,
+	},
+	reward = { auto = false, every = 300 },
+	esp = { fruit = false, plot = false, npc = false, vehicle = false, player = false, chest = false, pond = false, distance = true },
+	playerMods = {
+		fly = false, flySpeed = 60, noClip = false, infJump = false, lockStats = false,
+		walkSpeed = 16, jumpPower = 50, autoEquipCan = false, autoEquipRod = false,
+	},
+	teleport = { saved = {} },
+}
+HUB.State = State
+
+-- ══════════════════════════════════════════════════════════════
+--  4) UTIL
+-- ══════════════════════════════════════════════════════════════
+local function new(className, props, parent)
+	local inst = Instance.new(className)
+	if props then
+		for k, v in pairs(props) do
+			if k ~= "Parent" then
+				local ok, err = pcall(function() inst[k] = v end)
+				if not ok then warn("[HUB] set " .. tostring(k) .. " fail: " .. tostring(err)) end
+			end
+		end
+	end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+function HUB.Log(text, kind)
+	local stamp = os.date("%H:%M:%S")
+	local line = "[" .. stamp .. "] " .. tostring(text)
+	table.insert(HUB.LogLines, 1, line)
+	while #HUB.LogLines > 80 do table.remove(HUB.LogLines) end
+	if HUB.OnLog then pcall(HUB.OnLog, line, kind) end
+	if kind == "error" then warn(line) end
+end
+
+function HUB.Notify(text, kind)
+	if HUB.OnNotify and State.ui.notify then pcall(HUB.OnNotify, text, kind) end
+end
+
+-- tween helper ที่respect ความเร็ว tween ในตั้งค่า
+function HUB.Tween(obj, time, props, style, dir)
+	local t = clamp(time / (State.ui.tweenSpeed or 1), 0.01, 10)
+	local tw = TweenService:Create(obj, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+-- springy: อนิเมชันกดแบบเดียวกับในเกม (MouseEnter/Leave/Down/Up + Touch)
+function HUB.Springy(gui, hoverScale, pressScale)
+	local press = gui:FindFirstChild("Press")
+	if not (press and press:IsA("UIScale")) then
+		press = new("UIScale", { Name = "Press", Scale = 1 }, gui)
+	end
+	hoverScale = hoverScale or 1.04
+	pressScale = pressScale or 0.92
+	local hovering = false
+	local function to(scale, time, style)
+		HUB.Tween(press, time, { Scale = scale }, style or Enum.EasingStyle.Quad)
+	end
+	track(gui.MouseEnter:Connect(function() hovering = true  to(hoverScale, 0.12) end))
+	track(gui.MouseLeave:Connect(function() hovering = false to(1, 0.12) end))
+	track(gui.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			to(pressScale, 0.06)
+		end
+	end))
+	track(gui.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			to(hovering and hoverScale or 1, 0.28, Enum.EasingStyle.Back)
+		end
+	end))
+	return press
+end
+
+-- PopIn / PopOut แบบ UIKit ของเกม
+function HUB.PopIn(gui)
+	local pop = gui:FindFirstChild("Pop")
+	if not (pop and pop:IsA("UIScale")) then pop = new("UIScale", { Name = "Pop", Scale = 1 }, gui) end
+	gui:SetAttribute("PopState", "Opening")
+	gui.Visible = true
+	pop.Scale = 0.6
+	local tw = TweenService:Create(pop, TweenInfo.new(0.3 / (State.ui.tweenSpeed or 1), Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+	tw:Play()
+	track(tw.Completed:Once(function()
+		if gui:GetAttribute("PopState") == "Opening" then
+			gui:SetAttribute("PopState", "Open")
+			pop.Scale = 1
+		end
+	end))
+	return tw
+end
+
+function HUB.PopOut(gui, done)
+	local pop = gui:FindFirstChild("Pop")
+	if not (pop and pop:IsA("UIScale")) then pop = new("UIScale", { Name = "Pop", Scale = 1 }, gui) end
+	gui:SetAttribute("PopState", "Closing")
+	local tw = TweenService:Create(pop, TweenInfo.new(0.14 / (State.ui.tweenSpeed or 1), Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.7 })
+	tw:Play()
+	track(tw.Completed:Once(function()
+		if gui:GetAttribute("PopState") == "Closing" then
+			gui.Visible = false
+			gui:SetAttribute("PopState", "Closed")
+			pop.Scale = 1
+			if done then done() end
+		end
+	end))
+	return tw
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  5) REMOTES (แคช + หาแบบปลอดภัย)
+-- ══════════════════════════════════════════════════════════════
+local RemoteCache = {}
+local RemoteMissing = {}
+local function remotesFolder()
+	return ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:WaitForChild("Remotes", 20)
+end
+function HUB.Remote(name, timeout)
+	if RemoteCache[name] and RemoteCache[name].Parent then return RemoteCache[name] end
+	-- ถ้าเคยหาไม่เจอ ให้ลองใหม่ทุก 15 วิ (เผื่อเกมโหลด remote ช้า)
+	if RemoteMissing[name] and (os.clock() - (RemoteMissing[name] or 0)) < 15 then return nil end
+	local folder = remotesFolder()
+	local rem = folder and (folder:FindFirstChild(name) or folder:WaitForChild(name, timeout or 3))
+	if rem then
+		RemoteCache[name] = rem
+		RemoteMissing[name] = nil
+		return rem
+	end
+	if not RemoteMissing[name] then
+		HUB.Log("ไม่พบ remote: " .. name .. " (จะลองใหม่ใน 15 วิ)", "error")
+	end
+	RemoteMissing[name] = os.clock()
+	return nil
+end
+
+function HUB.Fire(name, ...)
+	local rem = HUB.Remote(name)
+	if not rem then return false end
+	-- หมายเหตุ: ใช้ pcall(f, ...) ตรง ๆ เพราะ '...' ใช้ใน closure ซ้อนไม่ได้
+	local ok, err = pcall(rem.FireServer, rem, ...)
+	if not ok then HUB.Log("ยิง " .. name .. " พลาด: " .. tostring(err), "error") end
+	return ok
+end
+
+function HUB.Invoke(name, ...)
+	local rem = HUB.Remote(name)
+	if not rem then return nil end
+	local packed = { pcall(rem.InvokeServer, rem, ...) }
+	if not packed[1] then return nil end
+	return packed[2]
+end
+
+-- config modules ของเกม (require แบบปลอดภัย)
+local ConfigCache = {}
+function HUB.Config(name)
+	if ConfigCache[name] ~= nil then return ConfigCache[name] end
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	local mod = shared and shared:FindFirstChild(name)
+	local ok, res = false, nil
+	if mod then ok, res = pcall(require, mod) end
+	ConfigCache[name] = (ok and type(res) == "table") and res or false
+	return ConfigCache[name]
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  6) WORLD HELPERS  (แกะโครงสร้างจากโค้ดเกมจริง)
+-- ══════════════════════════════════════════════════════════════
+local World = {}
+HUB.World = World
+
+function World.char()      return player.Character end
+function World.hrp()
+	local c = player.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+function World.hum()
+	local c = player.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+function World.pos()
+	local h = World.hrp()
+	return h and h.Position
+end
+function World.cash()
+	local ls = player:FindFirstChild("leaderstats")
+	local cash = ls and ls:FindFirstChild("Cash")
+	if cash then return tonumber(cash.Value) or 0 end
+	return tonumber(player:GetAttribute("Cash")) or 0
+end
+function World.rebirths() return tonumber(player:GetAttribute("Rebirths")) or 0 end
+function World.rebirthCost()
+	local cfg = HUB.Config("RebirthConfig")
+	local base = (cfg and cfg.BaseCost) or 25000
+	local growth = (cfg and cfg.CostGrowth) or 2
+	return math.floor(base * (growth ^ World.rebirths()))
+end
+
+-- สวน/ฐานของเรา: workspace.Map.Bases[x].OwnerUserId == UserId
+function World.myBase()
+	local map = Workspace:FindFirstChild("Map")
+	local bases = map and map:FindFirstChild("Bases")
+	if not bases then bases = Workspace:FindFirstChild("Bases") end
+	if not bases then return nil end
+	for _, b in ipairs(bases:GetChildren()) do
+		if b:GetAttribute("OwnerUserId") == player.UserId then return b end
+	end
+	return nil
+end
+
+function World.baseOf(inst)
+	local node = inst
+	while node and node.Parent do
+		if node.Parent.Name == "Bases" then return node end
+		node = node.Parent
+	end
+	return nil
+end
+
+function World.isMine(inst)
+	local base = World.baseOf(inst)
+	if not base then return false end
+	return base:GetAttribute("OwnerUserId") == player.UserId
+end
+
+-- อุปกรณ์ตาม GearId (Rod / WateringCan / Shovel / WaterGun / Sprayer / Disinfect_*)
+function World.toolByGear(gearId, prefix)
+	local places = { player.Character, player:FindFirstChild("Backpack") }
+	for _, place in ipairs(places) do
+		if place then
+			for _, t in ipairs(place:GetChildren()) do
+				if t:IsA("Tool") then
+					local g = t:GetAttribute("GearId")
+					if type(g) == "string" then
+						if prefix then
+							if g:sub(1, #gearId) == gearId then return t end
+						elseif g == gearId then
+							return t
+						end
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+function World.equip(tool)
+	if not tool then return false end
+	local hum = World.hum()
+	if not hum then return false end
+	if tool.Parent == player.Character then return true end
+	tool.Parent = player.Character
+	task.wait(0.05)
+	pcall(function() hum:EquipTool(tool) end)
+	task.wait(0.08)
+	return true
+end
+
+function World.inOwnTruck()
+	local hum = World.hum()
+	local seat = hum and hum.SeatPart
+	if not (seat and seat:IsA("VehicleSeat")) then return nil end
+	local model = seat:FindFirstAncestorWhichIsA("Model")
+	while model and not model:GetAttribute("VehicleId") do
+		model = model.Parent and model.Parent:FindFirstAncestorWhichIsA("Model")
+	end
+	if model and model:GetAttribute("OwnerUserId") == player.UserId then return model end
+	return nil
+end
+
+-- ── เทเลพอร์ต / เดิน ────────────────────────────────────────
+local lastTp = 0
+function World.teleportTo(target, yOffset)
+	local hrp = World.hrp()
+	if not hrp then return false end
+	local cf
+	if typeof(target) == "CFrame" then
+		cf = target
+	elseif typeof(target) == "Vector3" then
+		cf = CFrame.new(target + Vector3.new(0, yOffset or 3.2, 0))
+	elseif typeof(target) == "Instance" then
+		local pivot = (target.GetPivot and target:GetPivot()) or nil
+		cf = pivot or CFrame.new(target.Position + Vector3.new(0, yOffset or 3.2, 0))
+	else
+		return false
+	end
+	local now = os.clock()
+	if now - lastTp < 0.04 then task.wait(0.04) end
+	lastTp = os.clock()
+	local ok = pcall(function()
+		if player.Character and player.Character.PrimaryPart then
+			player.Character:PivotTo(cf)
+		else
+			hrp.CFrame = cf
+		end
+		hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end)
+	return ok
+end
+
+function World.walkTo(pos, timeout)
+	local hum = World.hum()
+	if not (hum and pos) then return false end
+	hum:MoveTo(pos)
+	return true
+end
+
+-- เข้าไปให้ใกล้จุด (วาร์ปถ้าไกลเกิน / เดินถ้าใกล้) แบบนุ่ม ๆ
+function World.nearTo(pos, dist, allowTp)
+	dist = dist or 6
+	local hrp = World.hrp()
+	if not (hrp and pos) then return false end
+	local flat = Vector3.new(hrp.Position.X - pos.X, 0, hrp.Position.Z - pos.Z)
+	if flat.Magnitude <= dist then return true end
+	if allowTp == false then
+		World.walkTo(pos)
+		local t0 = os.clock()
+		while os.clock() - t0 < 8 do
+			local h2 = World.hrp()
+			if not h2 then return false end
+			local d2 = Vector3.new(h2.Position.X - pos.X, 0, h2.Position.Z - pos.Z).Magnitude
+			if d2 <= dist then return true end
+			task.wait(0.15)
+		end
+		return false
+	end
+	local dir = flat.Magnitude > 0.2 and -flat.Unit or Vector3.new(0, 0, -1)
+	local stand = pos + dir * math.max(2.5, dist * 0.6)
+	World.teleportTo(Vector3.new(stand.X, pos.Y, stand.Z), 3.2)
+	task.wait(0.08)
+	return true
+end
+
+-- ── ผลไม้ที่เก็บได้ ──────────────────────────────────────────
+function World.ripePromptOf(fruit)
+	local part = fruit:FindFirstChildWhichIsA("BasePart", true)
+	local prompt = part and part:FindFirstChild("Harvest")
+	if not (prompt and prompt:IsA("ProximityPrompt")) then return nil end
+	if not prompt.Enabled then return nil end
+	if prompt:GetAttribute("Unripe") then return nil end
+	if fruit:GetAttribute("CatchBy") then return nil end
+	return prompt, part
+end
+
+function World.harvestTargets(onlyMine, maxDist)
+	local out = {}
+	local myPos = World.pos()
+	if not myPos then return out end
+	maxDist = maxDist or 1e9
+
+	-- (1) ผลที่แท็ก DurianFruit (ตรงกับที่เกมใช้)
+	local tagged = CollectionService:GetTagged("DurianFruit")
+	for _, fruit in ipairs(tagged) do
+		local prompt, part = World.ripePromptOf(fruit)
+		if prompt and part then
+			if not onlyMine or World.isMine(fruit) then
+				local d = (part.Position - myPos).Magnitude
+				if d <= maxDist then
+					table.insert(out, { prompt = prompt, part = part, model = fruit, dist = d, pos = part.Position, kind = fruit:GetAttribute("FruitId") or "Durian" })
+				end
+			end
+		end
+	end
+
+	-- (2) fallback: พรอมป์ชื่อ Harvest/Collect ที่ยังไม่ได้แท็ก (แคช 4 วิ กันกระตุก)
+	if #out == 0 then
+		local now = os.clock()
+		if World._fbCache and (now - World._fbCacheT) < 4 then
+			for _, e in ipairs(World._fbCache) do
+				if e.prompt and e.prompt.Parent then
+					local d = (e.pos - myPos).Magnitude
+					if d <= maxDist and (not onlyMine or World.isMine(e.part)) then
+						table.insert(out, { prompt = e.prompt, part = e.part, model = e.model, dist = d, pos = e.pos, kind = e.kind })
+					end
+				end
+			end
+			return out
+		end
+		local fb = {}
+		local map = Workspace:FindFirstChild("Map") or Workspace
+		local scanned = 0
+		for _, d in ipairs(map:GetDescendants()) do
+			scanned = scanned + 1
+			if scanned > 30000 then break end
+			if d:IsA("ProximityPrompt") and d.Enabled and (d.Name == "Harvest" or d.Name == "Collect" or d.Name == "Pick") then
+				local holder = d.Parent
+				if holder and holder:IsA("BasePart") then
+					if not onlyMine or World.isMine(holder) then
+						local dist = (holder.Position - myPos).Magnitude
+						table.insert(fb, { prompt = d, part = holder, model = holder.Parent, dist = dist, pos = holder.Position, kind = "Prompt" })
+					end
+				end
+			end
+		end
+		World._fbCache = fb
+		World._fbCacheT = now
+		for _, e in ipairs(fb) do
+			local d = (e.pos - myPos).Magnitude
+			if d <= maxDist and (not onlyMine or World.isMine(e.part)) then
+				table.insert(out, { prompt = e.prompt, part = e.part, model = e.model, dist = d, pos = e.pos, kind = e.kind })
+			end
+		end
+	end
+	return out
+end
+
+-- ── แปลงปลูก (PlantSpot ที่มี Tree/Seed) ─────────────────────
+function World.plantSpots(onlyMine, maxDist)
+	local out = {}
+	local myPos = World.pos()
+	if not myPos then return out end
+	maxDist = maxDist or 1e9
+	local roots = {}
+	local bases = Workspace.Map and Workspace.Map:FindFirstChild("Bases")
+	if onlyMine then
+		local mine = World.myBase()
+		if mine then table.insert(roots, mine) end
+	else
+		if bases then roots = bases:GetChildren() end
+	end
+	for _, root in ipairs(roots) do
+		for _, d in ipairs(root:GetDescendants()) do
+			if d.Name == "PlantSpot" and d:IsA("BasePart") then
+				local parent = d.Parent
+				if parent and (parent:FindFirstChild("Tree") or parent:FindFirstChild("Seed")) then
+					local dist = (d.Position - myPos).Magnitude
+					if dist <= maxDist then
+						table.insert(out, { spot = d, dist = dist, pos = d.Position, parent = parent })
+					end
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b) return a.dist < b.dist end)
+	return out
+end
+
+-- ── บ่อน้ำ (Well) ในสวนเรา ───────────────────────────────────
+function World.well()
+	local base = World.myBase()
+	if not base then return nil end
+	local direct = base:FindFirstChild("Well", true)
+	if direct then return direct end
+	for _, d in ipairs(base:GetDescendants()) do
+		local n = d.Name
+		if type(n) == "string" and (n:lower():find("well")) and (d:IsA("BasePart") or d:IsA("Model")) then
+			return d
+		end
+	end
+	return nil
+end
+
+function World.wellPos()
+	local w = World.well()
+	if not w then return nil end
+	if w:IsA("Model") then
+		local ok, pivot = pcall(function() return w:GetPivot() end)
+		return ok and pivot.Position or nil
+	end
+	return w.Position
+end
+
+-- ── บ่อปลา (จาก attribute ของผู้เล่น) ────────────────────────
+function World.pond()
+	local c = player:GetAttribute("PondCenter")
+	local r = player:GetAttribute("PondRadius")
+	if typeof(c) == "Vector3" and type(r) == "number" then return c, r end
+	return nil, nil
+end
+
+function World.pickBait()
+	local cfg = HUB.Config("FishingConfig")
+	local baits = (cfg and cfg.Baits) or { { Id = "Worm" }, { Id = "Shrimp" }, { Id = "Golden" } }
+	local sel = player:GetAttribute("FishSel")
+	if sel and (tonumber(player:GetAttribute("Bait_" .. tostring(sel))) or 0) > 0 then return sel end
+	for _, b in ipairs(baits) do
+		if b and b.Id and (tonumber(player:GetAttribute("Bait_" .. b.Id)) or 0) > 0 then return b.Id end
+	end
+	return nil
+end
+
+function World.baitCount(id)
+	return tonumber(player:GetAttribute("Bait_" .. tostring(id))) or 0
+end
+
+-- ── สแกนหาแลนด์มาร์กในแมพ (ใช้ทำปุ่มวาร์ป) ──────────────────
+local LandmarkKeys = {
+	"well", "market", "shop", "sell", "scale", "garage", "fish", "pond", "spawn",
+	"rebirth", "barn", "warehouse", "dock", "npc", "quest", "mine", "quest", "port",
+}
+function World.scanLandmarks(limit)
+	limit = limit or 60
+	local found, seen = {}, {}
+	local map = Workspace:FindFirstChild("Map") or Workspace
+	local count = 0
+	for _, d in ipairs(map:GetDescendants()) do
+		count = count + 1
+		if count > 40000 then break end
+		if d:IsA("BasePart") or d:IsA("Model") then
+			local n = string.lower(d.Name)
+			for _, key in ipairs(LandmarkKeys) do
+				if n:find(key, 1, true) then
+					local pos = nil
+					if d:IsA("Model") then
+						local ok, pivot = pcall(function() return d:GetPivot() end)
+						pos = ok and pivot.Position or nil
+					else
+						if d.Size.Magnitude > 1 and d.Transparency < 1 then pos = d.Position end
+					end
+					if pos and not seen[d.Name .. math.floor(pos.X) .. math.floor(pos.Z)] then
+						seen[d.Name .. math.floor(pos.X) .. math.floor(pos.Z)] = true
+						table.insert(found, { name = d.Name, pos = pos, inst = d })
+					end
+					break
+				end
+			end
+		end
+		if #found >= limit then break end
+	end
+	table.sort(found, function(a, b)
+		local pa, pb = World.pos(), World.pos()
+		local da = pa and (a.pos - pa).Magnitude or 0
+		local db = pb and (b.pos - pb).Magnitude or 0
+		return da < db
+	end)
+	return found
+end
+
+function World.spawnPoint()
+	local sp = Workspace:FindFirstChildOfClass("SpawnLocation")
+	if sp then return sp.Position + Vector3.new(0, 4, 0) end
+	local map = Workspace:FindFirstChild("Map")
+	if map then
+		local s = map:FindFirstChild("Spawn", true)
+		if s and s:IsA("BasePart") then return s.Position + Vector3.new(0, 4, 0) end
+	end
+	return nil
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  7) UI LIBRARY  (มือถือเฟรนด์ลี่ + tween สไตล์เกม)
+-- ══════════════════════════════════════════════════════════════
+local UI = {}
+HUB.UI = UI
+UI.Pages      = {}
+UI.Tabs       = {}
+UI.AccentBg   = {}   -- object ที่ต้องย้อมสี accent
+UI.AccentText = {}
+UI.Open       = false
+UI.Minimized  = false
+
+local ROOT_SCALE = 1
+
+local function corner(radius, parent) return new("UICorner", { CornerRadius = UDim.new(0, radius or 10) }, parent) end
+local function stroke(color, thickness, transp, parent)
+	return new("UIStroke", { Color = color or Theme.ink, Thickness = thickness or 1, Transparency = transp or 0, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, parent)
+end
+local function pad(t, b, l, r, parent)
+	return new("UIPadding", {
+		PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
+		PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0),
+	}, parent)
+end
+local function list(dir, spacing, parent)
+	return new(dir == "H" and "UIListLayout" or "UIListLayout", {
+		FillDirection = dir == "H" and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, spacing or 6),
+	}, parent)
+end
+local function gradient(c1, c2, rot, parent)
+	return new("UIGradient", { Color = ColorSequence.new(c1, c2), Rotation = rot or 90 }, parent)
+end
+
+function UI.registerAccent(obj, kind)
+	if kind == "text" then table.insert(UI.AccentText, obj) else table.insert(UI.AccentBg, obj) end
+end
+
+function UI.setAccent(accentId)
+	local found = Accents[1]
+	for _, a in ipairs(Accents) do if a.id == accentId then found = a end end
+	HUB.Accent, HUB.AccentDk = found.color, found.dark
+	State.ui.accent = found.id
+	for _, o in ipairs(UI.AccentBg) do
+		if o and o.Parent then
+			pcall(function() HUB.Tween(o, 0.22, { BackgroundColor3 = HUB.Accent }) end)
+			local g = o:FindFirstChildOfClass("UIGradient")
+			if g then pcall(function() g.Color = ColorSequence.new(HUB.Accent, HUB.AccentDk) end) end
+			for _, c in ipairs(o:GetChildren()) do
+				if c:IsA("UIStroke") and c.Color ~= Theme.ink then pcall(function() HUB.Tween(c, 0.22, { Color = HUB.Accent }) end) end
+			end
+		end
+	end
+	for _, o in ipairs(UI.AccentText) do
+		if o and o.Parent then pcall(function() HUB.Tween(o, 0.22, { TextColor3 = HUB.Accent }) end) end
+	end
+	if UI.Indicator and UI.Indicator.Parent then
+		HUB.Tween(UI.Indicator, 0.25, { BackgroundColor3 = HUB.Accent })
+	end
+	if UI.Launcher then
+		for _, d in ipairs(UI.Launcher:GetChildren()) do
+			if d:IsA("UIGradient") then pcall(function() d.Color = ColorSequence.new(HUB.Accent, HUB.AccentDk) end) end
+		end
+	end
+end
+
+-- ── ขนาดหน้าต่างตามจอ (มือถือ/แท็บเล็ต/PC) ────────────────────
+function UI.windowSize()
+	camera = Workspace.CurrentCamera or camera
+	local vp = (camera and camera.ViewportSize) or Vector2.new(1366, 768)
+	local inset = select(2, pcall(function() return GuiService:GetGuiInset() end))
+	local topInset = (type(inset) == "Vector2" and inset.Y) or 0
+	local sc = (UI.GuiScale and UI.GuiScale.Scale) or 1
+	local w = math.min(HUB.IsTouch and 460 or 430, (vp.X * 0.95) / sc)
+	local h = math.min(HUB.IsTouch and 620 or 560, (vp.Y * 0.92) / sc)
+	return w, h, topInset
+end
+
+-- จัดหน้าต่างกึ่งกลางจอ (คิด UIScale + safe area ให้แล้ว)
+function UI.centerWindow()
+	if not (UI.Window and UI.Window.Parent) then return end
+	camera = Workspace.CurrentCamera or camera
+	local vp = (camera and camera.ViewportSize) or Vector2.new(1366, 768)
+	local inset = select(2, pcall(function() return GuiService:GetGuiInset() end))
+	local topInset = (type(inset) == "Vector2" and inset.Y) or 0
+	local sc = (UI.GuiScale and UI.GuiScale.Scale) or 1
+	local w, h = UI.windowSize()
+	UI.Window.Size = UDim2.fromOffset(w, h)
+	UI.Window.Position = UDim2.fromOffset(
+		math.max(4 / sc, (vp.X / sc - w) / 2),
+		math.max((topInset + 6) / sc, (vp.Y / sc - h) / 2)
+	)
+end
+
+-- ══════════════ BUILD ══════════════
+function UI.build()
+	local gui = new("ScreenGui", {
+		Name = "DurianFarmHub", ResetOnSpawn = false, IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 99999,
+	}, playerGui)
+	UI.Root = gui
+
+	-- global scale
+	UI.GuiScale = new("UIScale", { Scale = State.ui.scale }, gui)
+
+	local w, h, topInset = UI.windowSize()
+
+	-- ── ปุ่มลอย (launcher) ──
+	local launcher = new("TextButton", {
+		Name = "Launcher", Size = UDim2.fromOffset(62, 62),
+		Position = UDim2.new(1, -78, 1, -160), BackgroundColor3 = HUB.Accent,
+		Text = "🌾", TextSize = 28, Font = Enum.Font.GothamBold, TextColor3 = Color3.new(1, 1, 1),
+		AutoButtonColor = false, ZIndex = 50, Active = true,
+	}, gui)
+	corner(31, launcher)
+	gradient(HUB.Accent, HUB.AccentDk, 90, launcher)
+	stroke(Color3.new(0, 0, 0), 2, 0.55, launcher)
+	UI.Launcher = launcher
+	UI.LauncherScale = HUB.Springy(launcher, 1.1, 0.88)
+
+	-- ── หน้าต่างหลัก ──
+	local win = new("Frame", {
+		Name = "Window", Size = UDim2.fromOffset(w, h),
+		Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2 + topInset * 0.5),
+		BackgroundColor3 = Theme.body, BorderSizePixel = 0, ClipsDescendants = true,
+		Visible = false, ZIndex = 10, Active = true,
+	}, gui)
+	corner(18, win)
+	stroke(Theme.ink, 2, 0.2, win)
+	UI.Window = win
+	UI.WinScale = new("UIScale", { Name = "Pop", Scale = 1 }, win)
+	gradient(Color3.fromRGB(48, 46, 58), Theme.body, 90, win)
+
+	-- TopBar (drag handle)
+	local top = new("TextButton", {
+		Name = "TopBar", Size = UDim2.new(1, 0, 0, 46), Position = UDim2.new(0, 0, 0, 0),
+		BackgroundColor3 = Theme.ink, BackgroundTransparency = 0.15, Text = "",
+		AutoButtonColor = false, ZIndex = 12, Active = true,
+	}, win)
+	new("UICorner", { CornerRadius = UDim.new(0, 18) }, top)
+	local topFix = new("Frame", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.new(0, 0, 1, -14), BackgroundColor3 = Theme.ink, BackgroundTransparency = 0.15, BorderSizePixel = 0, ZIndex = 12 }, top)
+	gradient(HUB.Accent, HUB.AccentDk, 0, top)
+	local topGrad = top:FindFirstChildOfClass("UIGradient")
+	if topGrad then topGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.72), NumberSequenceKeypoint.new(1, 0.94) }) end
+
+	local dot = new("Frame", { Size = UDim2.fromOffset(10, 10), Position = UDim2.new(0, 14, 0.5, -5), BackgroundColor3 = Theme.green, BorderSizePixel = 0, ZIndex = 14 }, top)
+	corner(5, dot)
+	UI.StatusDot = dot
+
+	local title = new("TextLabel", {
+		Size = UDim2.new(1, -120, 1, 0), Position = UDim2.new(0, 32, 0, 0),
+		BackgroundTransparency = 1, Text = "🌾 " .. HUB.Name, TextColor3 = Theme.text,
+		TextSize = 17, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 14,
+	}, top)
+	local ver = new("TextLabel", {
+		Size = UDim2.fromOffset(60, 14), Position = UDim2.new(0, 34, 1, -17),
+		BackgroundTransparency = 1, Text = "v" .. HUB.Version .. "  •  " .. HUB.Platform,
+		TextColor3 = Theme.muted, TextSize = 10, Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 14,
+	}, top)
+
+	local closeBtn = new("TextButton", {
+		Size = UDim2.fromOffset(34, 34), Position = UDim2.new(1, -42, 0.5, -17),
+		BackgroundColor3 = Theme.red, BackgroundTransparency = 0.25, Text = "✕",
+		TextColor3 = Theme.text, TextSize = 15, Font = Enum.Font.GothamBold,
+		AutoButtonColor = false, ZIndex = 15,
+	}, top)
+	corner(10, closeBtn)
+	HUB.Springy(closeBtn, 1.08, 0.88)
+
+	local minBtn = new("TextButton", {
+		Size = UDim2.fromOffset(34, 34), Position = UDim2.new(1, -80, 0.5, -17),
+		BackgroundColor3 = Theme.row, Text = "–", TextColor3 = Theme.text,
+		TextSize = 17, Font = Enum.Font.GothamBold, AutoButtonColor = false, ZIndex = 15,
+	}, top)
+	corner(10, minBtn)
+	HUB.Springy(minBtn, 1.08, 0.88)
+	UI.TopBar = top
+	UI.CloseBtn = closeBtn
+	UI.MinBtn = minBtn
+
+	-- Status bar (RichText)
+	local status = new("TextLabel", {
+		Name = "StatusBar", Size = UDim2.new(1, -16, 0, 26), Position = UDim2.new(0, 8, 0, 48),
+		BackgroundColor3 = Theme.track, BackgroundTransparency = 0.35, Text = "",
+		TextSize = 12, Font = Enum.Font.GothamMedium, TextColor3 = Theme.muted,
+		TextXAlignment = Enum.TextXAlignment.Left, RichText = true, ZIndex = 12,
+	}, win)
+	corner(8, status)
+	pad(0, 0, 10, 8, status)
+	UI.StatusBar = status
+
+	-- Tab bar
+	local tabBar = new("Frame", {
+		Name = "TabBar", Size = UDim2.new(1, -16, 0, 44), Position = UDim2.new(0, 8, 0, 78),
+		BackgroundTransparency = 1, ZIndex = 12,
+	}, win)
+	local scroller = new("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 0,
+		AutomaticCanvasSize = Enum.AutomaticSize.X, CanvasSize = UDim2.new(), ZIndex = 12,
+	}, tabBar)
+	local tabList = new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 6), VerticalAlignment = Enum.VerticalAlignment.Center,
+	}, scroller)
+	UI.TabScroller = scroller
+
+	local indicator = new("Frame", {
+		Size = UDim2.fromOffset(60, 3), Position = UDim2.new(0, 0, 1, -4),
+		BackgroundColor3 = HUB.Accent, BorderSizePixel = 0, ZIndex = 13, Visible = false,
+	}, tabBar)
+	corner(2, indicator)
+	UI.Indicator = indicator
+
+	-- Pages
+	local pages = new("Frame", {
+		Name = "Pages", Size = UDim2.new(1, -16, 1, -160), Position = UDim2.new(0, 8, 0, 126),
+		BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 11,
+	}, win)
+	UI.PagesHolder = pages
+
+	-- Footer
+	local footer = new("TextLabel", {
+		Name = "Footer", Size = UDim2.new(1, -16, 0, 24), Position = UDim2.new(0, 8, 1, -28),
+		BackgroundColor3 = Theme.track, BackgroundTransparency = 0.45, Text = "พร้อมใช้งาน",
+		TextSize = 11, Font = Enum.Font.Gotham, TextColor3 = Theme.muted,
+		TextXAlignment = Enum.TextXAlignment.Left, RichText = true, ZIndex = 12,
+	}, win)
+	corner(8, footer)
+	pad(0, 0, 10, 8, footer)
+	UI.Footer = footer
+
+	-- Toast container
+	local toasts = new("Frame", {
+		Name = "Toasts", Size = UDim2.new(1, 0, 0, 200), Position = UDim2.new(0, 0, 0, topInset + 8),
+		BackgroundTransparency = 1, ZIndex = 200, ClipsDescendants = false,
+	}, gui)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Center }, toasts)
+	UI.Toasts = toasts
+
+	-- Fly controls
+	UI.buildFlyPad(gui)
+
+	return gui
+end
+
+-- ปุ่มขึ้น/ลง สำหรับ Fly (มือถือ)
+function UI.buildFlyPad(parent)
+	local flyPad = new("Frame", {
+		Name = "FlyPad", Size = UDim2.fromOffset(70, 156), Position = UDim2.new(1, -86, 1, -330),
+		BackgroundTransparency = 1, Visible = false, ZIndex = 60,
+	}, parent)
+	new("UIListLayout", { Padding = UDim.new(0, 10), HorizontalAlignment = Enum.HorizontalAlignment.Center }, flyPad)
+	local up = new("TextButton", {
+		Name = "Up", Size = UDim2.fromOffset(70, 70), BackgroundColor3 = Theme.body,
+		Text = "▲", TextSize = 24, TextColor3 = Theme.text, Font = Enum.Font.GothamBold,
+		AutoButtonColor = false, ZIndex = 61,
+	}, flyPad)
+	corner(20, up); stroke(HUB.Accent, 2, 0.3, up)
+	local down = new("TextButton", {
+		Name = "Down", Size = UDim2.fromOffset(70, 70), BackgroundColor3 = Theme.body,
+		Text = "▼", TextSize = 24, TextColor3 = Theme.text, Font = Enum.Font.GothamBold,
+		AutoButtonColor = false, ZIndex = 61,
+	}, flyPad)
+	corner(20, down); stroke(HUB.Accent, 2, 0.3, down)
+	UI.FlyPad = flyPad
+	UI.FlyUp, UI.FlyDown = up, down
+end
+
+-- ══════════════ TAB / PAGE ══════════════
+function UI.addTab(id, icon, name)
+	local page = new("ScrollingFrame", {
+		Name = "Page_" .. id, Size = UDim2.new(1, 0, 1, 0), Position = UDim2.new(0, 0, 0, 0),
+		BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+		ScrollBarThickness = 4, ScrollBarImageColor3 = HUB.Accent,
+		VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar, ZIndex = 11,
+	}, UI.PagesHolder)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, page)
+	pad(2, 8, 0, 2, page)
+
+	local tabBtn = new("TextButton", {
+		Name = "Tab_" .. id, Size = UDim2.fromOffset(0, 38), AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = Theme.row, BackgroundTransparency = 0.35,
+		Text = icon .. "  " .. name, TextSize = 13, Font = Enum.Font.GothamBold,
+		TextColor3 = Theme.muted, AutoButtonColor = false, LayoutOrder = #UI.Pages + 1, ZIndex = 13,
+	}, UI.TabScroller)
+	corner(12, tabBtn)
+	pad(0, 0, 12, 12, tabBtn)
+	HUB.Springy(tabBtn, 1.05, 0.94)
+
+	local entry = { id = id, page = page, btn = tabBtn, widgets = {} }
+	table.insert(UI.Pages, entry)
+	UI.Tabs[id] = entry
+
+	track(tabBtn.Activated:Connect(function() UI.selectTab(id) end))
+	return entry
+end
+
+function UI.selectTab(id)
+	local target = UI.Tabs[id]
+	if not target then return end
+	UI.CurrentTab = id
+	for _, p in ipairs(UI.Pages) do
+		local isTarget = (p.id == id)
+		if isTarget then
+			p.page.Visible = true
+			p.page.CanvasPosition = Vector2.new(0, 0)
+			p.page.Position = UDim2.new(0, 26, 0, 0)
+			p.page.BackgroundTransparency = 1
+			HUB.Tween(p.page, 0.22, { Position = UDim2.new(0, 0, 0, 0) }, Enum.EasingStyle.Quint)
+			p.btn.BackgroundTransparency = 0
+			p.btn.BackgroundColor3 = HUB.Accent
+			p.btn.TextColor3 = Color3.new(1, 1, 1)
+		else
+			p.page.Visible = false
+			p.btn.BackgroundTransparency = 0.55
+			p.btn.BackgroundColor3 = Theme.row
+			p.btn.TextColor3 = Theme.muted
+		end
+	end
+	-- เลื่อน indicator ไปใต้แท็บ
+	task.defer(function()
+		if not (UI.Indicator and target.btn.Parent) then return end
+		UI.Indicator.Visible = true
+		local scale = (UI.GuiScale and UI.GuiScale.Scale) or 1
+		local rel = (target.btn.AbsolutePosition.X - UI.TabScroller.AbsolutePosition.X) / scale
+		local viewW = UI.TabScroller.AbsoluteSize.X / scale
+		local cp = UI.TabScroller.CanvasPosition.X
+		if rel < cp + 10 or rel + 90 > cp + viewW then
+			UI.TabScroller.CanvasPosition = Vector2.new(math.max(0, rel - 40), 0)
+			rel = (target.btn.AbsolutePosition.X - UI.TabScroller.AbsolutePosition.X) / scale
+		end
+		HUB.Tween(UI.Indicator, 0.26, {
+			Position = UDim2.new(0, rel, 1, -4),
+			Size = UDim2.fromOffset(math.max(28, target.btn.AbsoluteSize.X), 3),
+		}, Enum.EasingStyle.Back)
+	end)
+	if UI.OnTabChange then pcall(UI.OnTabChange, id) end
+end
+
+-- ══════════════ WIDGETS ══════════════
+local W = {}
+UI.W = W
+
+function W.section(page, text, order)
+	local f = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1,
+		LayoutOrder = order or #page.page:GetChildren(),
+	}, page.page)
+	local bar = new("Frame", { Size = UDim2.fromOffset(4, 16), Position = UDim2.new(0, 2, 0.5, -8), BackgroundColor3 = HUB.Accent, BorderSizePixel = 0 }, f)
+	corner(2, bar)
+	UI.registerAccent(bar)
+	new("TextLabel", {
+		Size = UDim2.new(1, -16, 1, 0), Position = UDim2.new(0, 14, 0, 0), BackgroundTransparency = 1,
+		Text = string.upper(tostring(text)), TextSize = 11, Font = Enum.Font.GothamBold,
+		TextColor3 = Theme.muted, TextXAlignment = Enum.TextXAlignment.Left,
+	}, f)
+	return f
+end
+
+function W.toggle(page, opts)
+	opts = opts or {}
+	local h = opts.desc and 58 or 48
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = Theme.row, BorderSizePixel = 0,
+		Text = "", AutoButtonColor = false, Active = true,
+		LayoutOrder = opts.order or #page.page:GetChildren(),
+	}, page.page)
+	corner(12, row)
+	stroke(Theme.ink, 1, 0.5, row)
+	HUB.Springy(row, 1.012, 0.985)
+
+	local label = new("TextLabel", {
+		Size = opts.desc and UDim2.new(1, -84, 0, 20) or UDim2.new(1, -84, 1, 0),
+		Position = UDim2.new(0, 14, 0, opts.desc and 10 or 0),
+		BackgroundTransparency = 1, Text = (opts.icon and opts.icon .. "  " or "") .. tostring(opts.name or ""),
+		TextColor3 = Theme.text, TextSize = 14, Font = Enum.Font.GothamSemiBold,
+		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 4,
+	}, row)
+	if opts.desc then
+		new("TextLabel", {
+			Size = UDim2.new(1, -84, 0, 16), Position = UDim2.new(0, 14, 0, 32),
+			BackgroundTransparency = 1, Text = tostring(opts.desc), TextColor3 = Theme.muted,
+			TextSize = 11, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true, ZIndex = 4,
+		}, row)
+	end
+
+	local sw = new("Frame", {
+		Size = UDim2.fromOffset(48, 27), Position = UDim2.new(1, -62, 0.5, -13),
+		BackgroundColor3 = Theme.off, BorderSizePixel = 0, ZIndex = 4, Active = false,
+	}, row)
+	corner(14, sw)
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(21, 21), Position = UDim2.new(0, 3, 0.5, -10),
+		BackgroundColor3 = Color3.fromRGB(235, 235, 240), BorderSizePixel = 0, ZIndex = 5, Active = false,
+	}, sw)
+	corner(11, knob)
+
+	local obj = { row = row, sw = sw, knob = knob, value = opts.default and true or false, onChange = opts.callback }
+	function obj:Set(v, silent)
+		v = v and true or false
+		obj.value = v
+		HUB.Tween(sw, 0.2, { BackgroundColor3 = v and HUB.Accent or Theme.off })
+		HUB.Tween(knob, 0.24, { Position = UDim2.new(0, v and 24 or 3, 0.5, -10) }, Enum.EasingStyle.Back)
+		if not silent and obj.onChange then pcall(obj.onChange, v) end
+	end
+	track(row.Activated:Connect(function() obj:Set(not obj.value) end))
+	obj:Set(obj.value, true)
+	table.insert(page.widgets, obj)
+	return obj
+end
+
+function W.slider(page, opts)
+	opts = opts or {}
+	local min, max = opts.min or 0, opts.max or 100
+	local dec = opts.decimals or 0
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = Theme.row, BorderSizePixel = 0,
+		LayoutOrder = opts.order or #page.page:GetChildren(),
+	}, page.page)
+	corner(12, row)
+	stroke(Theme.ink, 1, 0.5, row)
+
+	local label = new("TextLabel", {
+		Size = UDim2.new(1, -90, 0, 20), Position = UDim2.new(0, 14, 0, 8), BackgroundTransparency = 1,
+		Text = (opts.icon and opts.icon .. "  " or "") .. tostring(opts.name or ""), TextColor3 = Theme.text,
+		TextSize = 13, Font = Enum.Font.GothamSemiBold, TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local value = new("TextLabel", {
+		Size = UDim2.fromOffset(78, 20), Position = UDim2.new(1, -88, 0, 8), BackgroundTransparency = 1,
+		Text = "", TextColor3 = HUB.Accent, TextSize = 13, Font = Enum.Font.GothamBold,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, row)
+	UI.registerAccent(value, "text")
+
+	local hit = new("TextButton", {
+		Size = UDim2.new(1, -28, 0, 26), Position = UDim2.new(0, 14, 1, -32),
+		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Active = true, ZIndex = 3,
+	}, row)
+	local trackFrame = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 7), Position = UDim2.new(0, 0, 0.5, -3),
+		BackgroundColor3 = Theme.track, BorderSizePixel = 0, ZIndex = 3,
+	}, hit)
+	corner(4, trackFrame)
+	local fill = new("Frame", {
+		Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = HUB.Accent, BorderSizePixel = 0, ZIndex = 4,
+	}, trackFrame)
+	corner(4, fill)
+	UI.registerAccent(fill)
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(18, 18), Position = UDim2.new(0, -9, 0.5, -9),
+		BackgroundColor3 = Color3.fromRGB(245, 245, 248), BorderSizePixel = 0, ZIndex = 5,
+	}, fill)
+	corner(9, knob)
+	stroke(HUB.Accent, 2, 0.15, knob)
+
+	local knobScale = new("UIScale", { Scale = 1 }, knob)
+	local obj = { row = row, value = opts.default or min, onChange = opts.callback }
+	local function fmt(v)
+		local s = string.format("%." .. dec .. "f", v)
+		return s .. (opts.suffix or "")
+	end
+	function obj:Set(v, silent)
+		v = clamp(tonumber(v) or min, min, max)
+		obj.value = v
+		local ratio = (max > min) and (v - min) / (max - min) or 0
+		HUB.Tween(fill, 0.14, { Size = UDim2.new(ratio, 0, 1, 0) })
+		knob.Position = UDim2.new(ratio, -9, 0.5, -9)
+		value.Text = fmt(v)
+		if not silent and obj.onChange then pcall(obj.onChange, v) end
+	end
+	local function fromInput(input)
+		local x = input.Position.X
+		local p = trackFrame.AbsolutePosition.X
+		local s = math.max(trackFrame.AbsoluteSize.X, 1)
+		obj:Set(min + clamp((x - p) / s, 0, 1) * (max - min))
+	end
+	local dragging = false
+	track(hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			HUB.Tween(knobScale, 0.14, { Scale = 1.25 }, Enum.EasingStyle.Back)
+			fromInput(input)
+		end
+	end))
+	track(hit.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then fromInput(input) end
+	end))
+	track(hit.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+			HUB.Tween(knobScale, 0.2, { Scale = 1 }, Enum.EasingStyle.Back)
+		end
+	end))
+	obj:Set(obj.value, true)
+	table.insert(page.widgets, obj)
+	return obj
+end
+
+function W.button(page, opts)
+	opts = opts or {}
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, opts.height or 44), BackgroundColor3 = opts.color or HUB.Accent,
+		BorderSizePixel = 0, Text = (opts.icon and opts.icon .. "  " or "") .. tostring(opts.name or "ปุ่ม"),
+		TextColor3 = opts.textColor or Color3.new(1, 1, 1), TextSize = 14, Font = Enum.Font.GothamBold,
+		AutoButtonColor = false, Active = true, LayoutOrder = opts.order or #page.page:GetChildren(),
+	}, page.page)
+	corner(12, row)
+	gradient(opts.color or HUB.Accent, opts.color2 or HUB.AccentDk, 90, row)
+	stroke(Theme.ink, 1, 0.6, row)
+	HUB.Springy(row, 1.02, 0.95)
+	if not opts.color then UI.registerAccent(row) end
+	track(row.Activated:Connect(function()
+		if opts.callback then
+			local ok, err = pcall(opts.callback)
+			if not ok then HUB.Log("ปุ่มผิดพลาด: " .. tostring(err), "error") end
+		end
+	end))
+	function row:SetText(t) row.Text = (opts.icon and opts.icon .. "  " or "") .. tostring(t) end
+	table.insert(page.widgets, row)
+	return row
+end
+
+function W.label(page, text, opts)
+	opts = opts or {}
+	local l = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, opts.height or 22), BackgroundColor3 = opts.bg or Theme.row,
+		BackgroundTransparency = opts.bg and 0 or 1, BorderSizePixel = 0,
+		Text = tostring(text or ""), RichText = true, TextColor3 = opts.color or Theme.muted,
+		TextSize = opts.size or 12, Font = Enum.Font.Gotham, TextWrapped = true,
+		TextXAlignment = opts.align or Enum.TextXAlignment.Left,
+		LayoutOrder = opts.order or #page.page:GetChildren(),
+	}, page.page)
+	if opts.bg then corner(10, l); pad(6, 6, 10, 10, l) end
+	function l:Set(t) l.Text = tostring(t) end
+	table.insert(page.widgets, l)
+	return l
+end
+
+function W.dropdown(page, opts)
+	opts = opts or {}
+	local options = opts.options or {}
+	local holder = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1, BorderSizePixel = 0,
+		LayoutOrder = opts.order or #page.page:GetChildren(), ClipsDescendants = false,
+	}, page.page)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = Theme.row, BorderSizePixel = 0,
+		Text = tostring(opts.name or "เลือก") .. "   •   ", TextColor3 = Theme.text, TextSize = 13,
+		Font = Enum.Font.GothamSemiBold, TextXAlignment = Enum.TextXAlignment.Left,
+		AutoButtonColor = false, Active = true,
+	}, holder)
+	corner(12, btn)
+	stroke(Theme.ink, 1, 0.5, btn)
+	pad(0, 0, 14, 40, btn)
+	HUB.Springy(btn, 1.01, 0.98)
+	local val = new("TextLabel", {
+		Size = UDim2.fromOffset(120, 44), Position = UDim2.new(1, -150, 0, 0), BackgroundTransparency = 1,
+		Text = "", TextColor3 = HUB.Accent, TextSize = 13, Font = Enum.Font.GothamBold,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, btn)
+	UI.registerAccent(val, "text")
+	local arrow = new("TextLabel", {
+		Size = UDim2.fromOffset(24, 44), Position = UDim2.new(1, -30, 0, 0), BackgroundTransparency = 1,
+		Text = "▾", TextColor3 = Theme.muted, TextSize = 14, Font = Enum.Font.GothamBold,
+	}, btn)
+
+	local listBox = new("Frame", {
+		Size = UDim2.new(1, -8, 0, 0), Position = UDim2.new(0, 4, 0, 48),
+		BackgroundColor3 = Theme.rowAlt, BorderSizePixel = 0, Visible = false, ClipsDescendants = true, ZIndex = 6,
+	}, holder)
+	corner(12, listBox)
+	stroke(HUB.Accent, 1, 0.55, listBox)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, listBox)
+	pad(4, 4, 4, 4, listBox)
+
+	local obj = { value = opts.default or options[1], onChange = opts.callback, open = false }
+	obj.rows = {}
+	local function rebuild(list2)
+		for _, r in ipairs(listBox:GetChildren()) do if r:IsA("TextButton") then r:Destroy() end end
+		obj.rows = {}
+		for i, o in ipairs(list2 or options) do
+			local text = type(o) == "table" and (o.name or o.Name or tostring(o.id)) or tostring(o)
+			local idv = type(o) == "table" and (o.id or o.Id or text) or o
+			local r = new("TextButton", {
+				Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Theme.ink, BackgroundTransparency = 0.35,
+				BorderSizePixel = 0, Text = text, TextColor3 = Theme.text, TextSize = 13,
+				Font = Enum.Font.GothamMedium, AutoButtonColor = false, LayoutOrder = i, ZIndex = 7,
+			}, listBox)
+			corner(9, r)
+			track(r.Activated:Connect(function()
+				obj.value = idv
+				val.Text = text
+				obj.open = false
+				HUB.Tween(listBox, 0.18, { Size = UDim2.new(1, -8, 0, 0) })
+				HUB.Tween(arrow, 0.2, { Rotation = 0 })
+				task.delay(0.2, function() if not obj.open then listBox.Visible = false end end)
+				if obj.onChange then pcall(obj.onChange, idv, text) end
+			end))
+			table.insert(obj.rows, { btn = r, id = idv, text = text })
+		end
+	end
+	rebuild()
+	function obj:SetOptions(list2) rebuild(list2) end
+	function obj:Set(v, silent)
+		obj.value = v
+		for _, r in ipairs(obj.rows) do if r.id == v then val.Text = r.text end end
+		if not silent and obj.onChange then pcall(obj.onChange, v) end
+	end
+	track(btn.Activated:Connect(function()
+		obj.open = not obj.open
+		if obj.open then
+			listBox.Visible = true
+			local h = #obj.rows * 40 + 8
+			HUB.Tween(listBox, 0.24, { Size = UDim2.new(1, -8, 0, h) }, Enum.EasingStyle.Back)
+			HUB.Tween(arrow, 0.24, { Rotation = 180 })
+		else
+			HUB.Tween(listBox, 0.16, { Size = UDim2.new(1, -8, 0, 0) })
+			HUB.Tween(arrow, 0.16, { Rotation = 0 })
+			task.delay(0.18, function() if not obj.open then listBox.Visible = false end end)
+		end
+	end))
+	val.Text = tostring(obj.value or "")
+	table.insert(page.widgets, obj)
+	return obj
+end
+
+-- กล่อง log (เลื่อนดูได้)
+function W.logBox(page, height)
+	local box = new("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 0, height or 160), BackgroundColor3 = Theme.track, BorderSizePixel = 0,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+		ScrollBarThickness = 4, ScrollBarImageColor3 = HUB.Accent,
+		LayoutOrder = 9999,
+	}, page.page)
+	corner(12, box)
+	stroke(Theme.ink, 1, 0.4, box)
+	local text = new("TextLabel", {
+		Size = UDim2.new(1, -16, 0, 16), BackgroundTransparency = 1, Text = "",
+		RichText = true, TextColor3 = Theme.muted, TextSize = 11, Font = Enum.Font.Code,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+	}, box)
+	pad(8, 8, 8, 8, text)
+	return box, text
+end
+
+-- ══════════════ TOAST / NOTIFY ══════════════
+local ToastKinds = {
+	ok    = { icon = "✅", color = Theme.green },
+	warn  = { icon = "⚠️", color = Theme.gold },
+	error = { icon = "❌", color = Theme.red },
+	info  = { icon = "💬", color = HUB.Accent },
+}
+local toastCounter = 0
+function UI.notify(text, kind)
+	kind = kind or "info"
+	local k = ToastKinds[kind] or ToastKinds.info
+	toastCounter = toastCounter + 1
+	local vpX = (camera and camera.ViewportSize.X) or 800
+	local wrap = new("Frame", {
+		Size = UDim2.fromOffset(math.min(430, vpX * 0.88), 48), BackgroundTransparency = 1,
+		ZIndex = 201, LayoutOrder = toastCounter, ClipsDescendants = false,
+	}, UI.Toasts)
+
+	local card = new("Frame", {
+		Size = UDim2.new(1, 0, 1, -6), Position = UDim2.new(0, 0, 0, -60),
+		BackgroundColor3 = Theme.body, BackgroundTransparency = 0, BorderSizePixel = 0, ZIndex = 202,
+	}, wrap)
+	corner(12, card)
+	stroke(k.color, 1.5, 0.35, card)
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+	}, card)
+	pad(0, 0, 10, 10, card)
+	new("TextLabel", {
+		Size = UDim2.new(0, 24, 1, 0), BackgroundTransparency = 1, Text = k.icon, TextSize = 16,
+		ZIndex = 203,
+	}, card)
+	new("TextLabel", {
+		Size = UDim2.new(1, -46, 1, 0), BackgroundTransparency = 1, Text = tostring(text),
+		TextColor3 = Theme.text, TextSize = 13, Font = Enum.Font.GothamSemiBold,
+		TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, ZIndex = 203,
+	}, card)
+
+	HUB.Tween(card, 0.34, { Position = UDim2.new(0, 0, 0, 0) }, Enum.EasingStyle.Back)
+	task.delay(2.7, function()
+		if not wrap.Parent then return end
+		local tw = HUB.Tween(card, 0.24, { Position = UDim2.new(0, 0, 0, -60), BackgroundTransparency = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tw.Completed:Connect(function() if wrap.Parent then wrap:Destroy() end end)
+	end)
+end
+
+HUB.OnNotify = function(text, kind) UI.notify(text, kind) end
+
+function UI.playSound(id, vol, rate)
+	if not State.ui.sound then return end
+	pcall(function()
+		local s = Instance.new("Sound")
+		s.SoundId = id
+		s.Volume = vol or 0.4
+		s.PlaybackSpeed = rate or 1
+		s.Parent = GuiService
+		s:Play()
+		Debris:AddItem(s, 3)
+	end)
+end
+
+function UI.refreshLog()
+	if not UI.LogText then return end
+	local lines = {}
+	for i = 1, math.min(#HUB.LogLines, 40) do lines[i] = HUB.LogLines[i] end
+	UI.LogText.Text = #lines > 0 and table.concat(lines, "\n") or "ยังไม่มี log"
+end
+HUB.OnLog = function(line, kind)
+	UI.refreshLog()
+	local color = kind == "error" and "255,140,140" or (kind == "ok" and "150,255,120" or "200,200,210")
+	if UI.Footer then
+		UI.Footer.Text = '<font color="rgb(' .. color .. ')">' .. line:gsub("^%[[%d:]+%] ", "") .. "</font>"
+	end
+end
+
+-- ══════════════ เปิด/ปิดหน้าต่าง ══════════════
+function UI.setOpen(open)
+	if UI.Open == open then return end
+	UI.Open = open
+	if open then
+		UI.Launcher.Visible = false
+		HUB.PopIn(UI.Window)
+		UI.playSound("rbxassetid://6895079853", 0.3, 1.3)
+		UI.selectTab(UI.CurrentTab or (UI.Pages[1] and UI.Pages[1].id))
+	else
+		HUB.PopOut(UI.Window, function() UI.Launcher.Visible = true end)
+		UI.playSound("rbxassetid://6895079853", 0.25, 0.9)
+	end
+end
+
+function UI.setMinimized(min)
+	UI.Minimized = min
+	if min then
+		HUB.PopOut(UI.Window, function() UI.Launcher.Visible = true end)
+	else
+		UI.Launcher.Visible = false
+		HUB.PopIn(UI.Window)
+	end
+end
+
+-- ── ลากหน้าต่าง ──
+function UI.makeDraggable(frame, handle)
+	local dragging, dragInput, dragStart, startPos
+	track(handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragInput = input
+			dragStart = input.Position
+			startPos = frame.Position
+		end
+	end))
+	track(handle.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local d = input.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	track(handle.InputEnded:Connect(function(input)
+		if input == dragInput then
+			dragging = false
+			UI.clampWindow()
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local d = input.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+end
+
+function UI.clampWindow()
+	local vp = (camera and camera.ViewportSize) or Vector2.new(1366, 768)
+	local inset = select(2, pcall(function() return GuiService:GetGuiInset() end))
+	local topInset = (type(inset) == "Vector2" and inset.Y) or 0
+	local scale = (UI.GuiScale and UI.GuiScale.Scale) or 1
+	local size = UI.Window.AbsoluteSize
+	local pos = UI.Window.AbsolutePosition
+	local x = clamp(pos.X, 4, math.max(4, vp.X - size.X - 4))
+	local y = clamp(pos.Y, topInset + 2, math.max(topInset + 2, vp.Y - 44))
+	if math.abs(x - pos.X) > 1 or math.abs(y - pos.Y) > 1 then
+		UI.Window.Position = UDim2.fromOffset(x / scale, y / scale)
+	end
+end
+
+-- ── ปุ่มลอย: ลาก + snap ขอบจอ ──
+function UI.makeLauncherDraggable()
+	local launcher = UI.Launcher
+	local dragging, moved, dragInput, dragStart, startPos
+	track(launcher.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			dragInput = input
+			dragStart = input.Position
+			startPos = launcher.Position
+			HUB.Tween(UI.LauncherScale, 0.12, { Scale = 1.12 }, Enum.EasingStyle.Back)
+		end
+	end))
+	track(launcher.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local d = input.Position - dragStart
+			if d.Magnitude > 6 then moved = true end
+			launcher.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	local function endDrag(input)
+		if input == dragInput and dragging then
+			dragging = false
+			HUB.Tween(UI.LauncherScale, 0.22, { Scale = 1 }, Enum.EasingStyle.Back)
+			if moved then
+				local vp = (camera and camera.ViewportSize) or Vector2.new(1366, 768)
+				local p = launcher.AbsolutePosition
+				local size = launcher.AbsoluteSize
+				local left = p.X < (vp.X / 2)
+				local x = left and 8 or (vp.X - size.X - 8)
+				local y = clamp(p.Y, 60, vp.Y - size.Y - 20)
+				HUB.Tween(launcher, 0.28, { Position = UDim2.fromOffset(x, y) }, Enum.EasingStyle.Back)
+			end
+		end
+	end
+	track(launcher.InputEnded:Connect(endDrag))
+	track(launcher.Activated:Connect(function()
+		if not moved then UI.setOpen(not UI.Open) end
+	end))
+end
+
+-- ══════════════ สถานะ / FPS ══════════════
+function UI.statusLoop()
+	task.spawn(function()
+		local frames, lastT = 0, os.clock()
+		local fps = 60
+		track(RunService.RenderStepped:Connect(function()
+			frames = frames + 1
+			local now = os.clock()
+			if now - lastT >= 0.5 then
+				fps = math.floor(frames / (now - lastT))
+				frames, lastT = 0, now
+			end
+		end))
+		while HUB.Alive and task.wait(0.4) do
+			camera = Workspace.CurrentCamera or camera
+			if UI.StatusBar and UI.StatusBar.Parent then
+				local cash = World.cash()
+				local rb = World.rebirths()
+				local water = tonumber(player:GetAttribute("WaterUses")) or 0
+				local ripe = #CollectionService:GetTagged("DurianFruit")
+				UI.StatusBar.Text = string.format(
+					'<font color="#ffd45e">💰 %s</font>   <font color="#c084ff">🔮 R%d</font>   <font color="#7fd4ff">💧 %d</font>   <font color="#9be86a">🍈 %d</font>',
+					tostring(cash), rb, water, ripe
+				)
+			end
+			UI.FpsText = fps
+			if UI.FpsLabel and UI.FpsLabel.Parent then UI.FpsLabel.Text = fps .. " FPS" end
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  8) FEATURE: 🌾 ฟาร์มอัตโนมัติ
+-- ══════════════════════════════════════════════════════════════
+local Farm = {}
+HUB.Farm = Farm
+Farm.lastRebirthTry = 0
+Farm.stats = { harvested = 0, watered = 0, sold = 0, rebirths = 0, fish = 0 }
+
+function UI.setStatus(text, color)
+	if UI.Footer and UI.Footer.Parent then
+		UI.Footer.Text = '<font color="' .. (color or "#c8c8d2") .. '">' .. tostring(text) .. "</font>"
+	end
+end
+
+-- ── เก็บเกี่ยว ──
+function Farm.harvestOnce(limit)
+	limit = limit or 999
+	local targets = World.harvestTargets(State.farm.onlyMine, State.farm.reachDist)
+	if #targets == 0 then return 0 end
+	table.sort(targets, function(a, b) return a.dist < b.dist end)
+	local rem = HUB.Remote("HarvestFruit")
+	local hasFirePrompt = (typeof(fireproximityprompt) == "function")
+	local count = 0
+	for i = 1, math.min(limit, #targets) do
+		if not HUB.Alive then break end
+		local t = targets[i]
+		if t.prompt and t.prompt.Parent then
+			if State.farm.tpToTarget and t.dist > (State.farm.standDist + 2) then
+				World.nearTo(t.pos, State.farm.standDist)
+				task.wait(0.1)
+			end
+			local hold = t.prompt.HoldDuration or 0
+			local ok = false
+			if rem then
+				if hold > 0 then
+					ok = select(1, pcall(function() rem:FireServer(t.prompt, "PullStart") end))
+					task.wait(math.min(hold, 3) + 0.06)
+					if t.prompt.Parent then pcall(function() rem:FireServer(t.prompt) end) end
+				else
+					ok = select(1, pcall(function() rem:FireServer(t.prompt) end))
+				end
+			elseif hasFirePrompt then
+				ok = select(1, pcall(fireproximityprompt, t.prompt))
+			end
+			if ok then
+				count = count + 1
+				Farm.stats.harvested = Farm.stats.harvested + 1
+			end
+			task.wait(State.farm.harvestDelay)
+		end
+	end
+	if count > 0 then UI.setStatus("🍈 เก็บเกี่ยวแล้ว " .. count .. " ผล", "#9be86a") end
+	return count
+end
+
+-- ── เติมน้ำที่บ่อ ──
+function Farm.refillWater()
+	local wellPos = World.wellPos()
+	if not wellPos then
+		UI.setStatus("⚠️ ไม่พบบ่อน้ำในสวน (ต้องซื้อ Water Well ก่อน)", "#ffd45e")
+		return false
+	end
+	local hrp = World.hrp()
+	if hrp and (hrp.Position - wellPos).Magnitude > 12 then
+		World.nearTo(wellPos, 6)
+		task.wait(0.15)
+	end
+	local before = tonumber(player:GetAttribute("WaterUses")) or 0
+	-- เกมยิง Water ที่ตำแหน่งตัวเองตอนน้ำหมด = เติมที่บ่อ
+	HUB.Fire("Water", "Water", (World.pos() or wellPos))
+	local t0 = os.clock()
+	while os.clock() - t0 < 3 do
+		task.wait(0.2)
+		local now = tonumber(player:GetAttribute("WaterUses")) or 0
+		if now > before then
+			UI.setStatus("💧 เติมน้ำแล้ว (" .. now .. " ครั้ง)", "#7fd4ff")
+			return true
+		end
+	end
+	UI.setStatus("⚠️ เติมน้ำไม่สำเร็จ (อาจต้องยืนใกล้บ่อมากขึ้น)", "#ffd45e")
+	return false
+end
+
+-- ── รดน้ำ ──
+function Farm.waterOnce()
+	local can = World.toolByGear("WateringCan")
+	if not can then
+		UI.setStatus("⚠️ ไม่พบบัวรดน้ำในกระเป๋า", "#ffd45e")
+		return 0
+	end
+	World.equip(can)
+	local uses = tonumber(player:GetAttribute("WaterUses")) or 0
+	if uses <= 0 and State.farm.refill then
+		Farm.refillWater()
+		uses = tonumber(player:GetAttribute("WaterUses")) or 0
+	end
+	if uses <= 0 then return 0 end
+	local spots = World.plantSpots(State.farm.onlyMine, State.farm.reachDist)
+	if #spots == 0 then
+		UI.setStatus("🌱 ไม่พบต้นที่รดน้ำได้", "#c8c8d2")
+		return 0
+	end
+	local watered = 0
+	for _, s in ipairs(spots) do
+		if not HUB.Alive or not State.farm.water then break end
+		if watered >= uses then break end
+		local hrp = World.hrp()
+		local aimPos = s.pos
+		if hrp then
+			local flat = Vector3.new(hrp.Position.X - s.pos.X, 0, hrp.Position.Z - s.pos.Z)
+			if flat.Magnitude > 0.1 then aimPos = s.pos + flat.Unit * 1.2 end
+		end
+		if State.farm.tpToTarget and s.dist > (State.farm.standDist + 2) then
+			World.nearTo(s.pos, State.farm.standDist)
+			task.wait(0.1)
+			hrp = World.hrp()
+			if hrp then
+				local flat2 = Vector3.new(hrp.Position.X - s.pos.X, 0, hrp.Position.Z - s.pos.Z)
+				if flat2.Magnitude > 0.1 then aimPos = s.pos + flat2.Unit * 1.2 end
+			end
+		end
+		if HUB.Fire("Water", "Water", aimPos) then
+			watered = watered + 1
+			Farm.stats.watered = Farm.stats.watered + 1
+		end
+		task.wait(State.farm.waterDelay)
+	end
+	if watered > 0 then UI.setStatus("💧 รดน้ำ " .. watered .. " แปลง", "#7fd4ff") end
+	return watered
+end
+
+-- ── ขาย ──
+function Farm.sellTruck()
+	if not World.inOwnTruck() then return false end
+	if HUB.Fire("Cargo", "Sell") then
+		Farm.stats.sold = Farm.stats.sold + 1
+		UI.setStatus("🚚 ขายขึ้นรถแล้ว", "#ffd45e")
+		return true
+	end
+	return false
+end
+
+function Farm.sellStall()
+	local rem = HUB.Remote("SellDurians")
+	if not rem then return false end
+	local kinds = { "All", "LumpAll", "PalmAll" }
+	local fired = 0
+	for _, k in ipairs(kinds) do
+		if pcall(function() rem:FireServer(k) end) then fired = fired + 1 end
+		task.wait(0.08)
+	end
+	if fired > 0 then UI.setStatus("🏪 ส่งคำสั่งขายที่แผงแล้ว", "#ffd45e") end
+	return fired > 0
+end
+
+-- ── Rebirth ──
+function Farm.tryRebirth(force)
+	local rebirths = World.rebirths()
+	local cfg = HUB.Config("RebirthConfig")
+	local maxR = (cfg and cfg.MaxRebirths) or 25
+	if rebirths >= maxR then
+		UI.setStatus("🔮 Rebirth เต็มแล้ว (" .. rebirths .. "/" .. maxR .. ")", "#c084ff")
+		return false
+	end
+	local cost = World.rebirthCost()
+	local cash = World.cash()
+	if not force and cash < cost then return false end
+	local res = HUB.Invoke("Rebirth")
+	Farm.stats.rebirths = Farm.stats.rebirths + 1
+	UI.setStatus("🔮 Rebirth! (เงิน " .. tostring(cash) .. " / ต้องการ " .. tostring(cost) .. ")", "#c084ff")
+	HUB.Notify("Rebirth สำเร็จครั้งที่ " .. tostring(World.rebirths()), "ok")
+	return true
+end
+
+-- ── รับทุเรียนร่วง (Catch minigame) ──
+function Farm.catchStep()
+	local char = World.char()
+	if not char then return false end
+	if not char:GetAttribute("CatchStart") then return false end
+	if char:GetAttribute("CatchLock") then return true end
+	local targetVal = char:FindFirstChild("CatchTarget")
+	local target = targetVal and targetVal.Value
+	if not (target and target.Parent) then return true end
+	local ok, cf = pcall(function() return target:GetBoundingBox() end)
+	if not ok then return true end
+	local hrp = World.hrp()
+	local hum = World.hum()
+	if hum then pcall(function() hum:MoveTo(Vector3.new(cf.Position.X, hrp and hrp.Position.Y or cf.Position.Y, cf.Position.Z)) end) end
+	if State.farm.tpToTarget and hrp then
+		World.teleportTo(Vector3.new(cf.Position.X, hrp.Position.Y, cf.Position.Z), 0)
+	end
+	return true
+end
+
+-- ── Master loop ──
+function Farm.loop()
+	task.spawn(function()
+		while HUB.Alive and task.wait(0.15) do
+			local ok, err = pcall(function()
+				if not State.farm.master then return end
+				if not World.hrp() then return end
+				if State.farm.autoCatch then Farm.catchStep() end
+				if State.farm.harvest then Farm.harvestOnce(30) end
+				if State.farm.water then Farm.waterOnce() end
+				if State.farm.sellStall then Farm.sellStall() end
+				if State.farm.sellTruck then Farm.sellTruck() end
+				if State.farm.rebirth and (os.clock() - Farm.lastRebirthTry) > State.farm.rebirthEvery then
+					Farm.lastRebirthTry = os.clock()
+					Farm.tryRebirth(false)
+				end
+			end)
+			if not ok then HUB.Log("farm loop: " .. tostring(err), "error") end
+			task.wait(State.farm.cycleDelay)
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  9) FEATURE: 🎣 ตกปลาอัตโนมัติ
+-- ══════════════════════════════════════════════════════════════
+local Fish = {}
+HUB.Fish = Fish
+Fish.lastCast = 0
+Fish.caught = 0
+
+function Fish.castTarget(depth)
+	depth = depth or 0
+	local pc, pr = World.pond()
+	if not pc then return nil, "noPond" end
+	local hrp = World.hrp()
+	if not hrp then return nil, "noChar" end
+	local cfg = HUB.Config("FishingConfig")
+	local castRange = (cfg and cfg.CastRange) or 36
+	local from = hrp.Position
+	local flat = Vector3.new(pc.X - from.X, 0, pc.Z - from.Z)
+	local dist = flat.Magnitude
+	if dist > castRange * 0.9 and State.fish.tpToPond and depth < 1 then
+		local dir = dist > 0.5 and flat.Unit or Vector3.new(1, 0, 0)
+		local stand = pc - dir * math.max(6, pr * 0.55)
+		World.teleportTo(Vector3.new(stand.X, from.Y, stand.Z), 3)
+		task.wait(0.2)
+		return Fish.castTarget(depth + 1)
+	end
+	if dist > castRange then return nil, "tooFar" end
+	local step = math.min(dist, castRange * 0.8)
+	local p = (dist > 0.5) and (from + flat.Unit * step) or (from + Vector3.new(step, 0, 0))
+	local off = Vector3.new(p.X - pc.X, 0, p.Z - pc.Z)
+	if off.Magnitude > math.max(pr - 3, 1) then p = pc + off.Unit * math.max(pr - 3, 1) end
+	return Vector3.new(p.X, 0, p.Z)
+end
+
+function Fish.cast()
+	local rod = World.toolByGear("Rod")
+	if not rod then UI.setStatus("⚠️ ไม่พบเบ็ดตกปลาในกระเป๋า", "#ffd45e") return false end
+	World.equip(rod)
+	if rod:GetAttribute("FishState") then return false end
+	if not player:GetAttribute("OwnPond") then
+		UI.setStatus("⚠️ ยังไม่มีบ่อปลา (ซื้อ Fishing Pond หลังสวน)", "#ffd45e")
+		return false
+	end
+	local bait = State.fish.baitAuto and World.pickBait() or State.fish.bait
+	if not bait or World.baitCount(bait) <= 0 then
+		UI.setStatus("⚠️ เหยื่อหมด! ซื้อที่ร้านขายปลา", "#ff9c9c")
+		return false
+	end
+	local cap = tonumber(player:GetAttribute("FishCap")) or 0
+	local cnt = tonumber(player:GetAttribute("FishCount")) or 0
+	if cap > 0 and cnt >= cap then
+		UI.setStatus("🎣 ถังปลาเต็ม (" .. cnt .. "/" .. cap .. ") ไปขายก่อน", "#ffd45e")
+		return false
+	end
+	local target, err = Fish.castTarget()
+	if not target then
+		if err == "tooFar" then UI.setStatus("⚠️ อยู่ห่างบ่อปลาเกินไป", "#ffd45e") end
+		return false
+	end
+	local hrp = World.hrp()
+	if hrp then
+		pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.X, hrp.Position.Y, target.Z)) end)
+	end
+	task.wait(0.08)
+	if HUB.Fire("Fishing", "Cast", target, bait) then
+		Fish.lastCast = os.clock()
+		UI.setStatus("🎣 หย่อนเบ็ดแล้ว (เหยื่อ " .. tostring(bait) .. ")", "#7fd4ff")
+		return true
+	end
+	return false
+end
+
+function Fish.loop()
+	task.spawn(function()
+		while HUB.Alive and task.wait(0.08) do
+			if State.fish.auto then
+				pcall(function()
+					local rod = World.toolByGear("Rod")
+					if rod then
+						local st = rod:GetAttribute("FishState")
+						if st == "Bite" and State.fish.autoHook then
+							HUB.Fire("Fishing", "Hook")
+							UI.setStatus("🐟 ปลาติดเบ็ด! วัดเบ็ดแล้ว", "#9be86a")
+							Fish.lastCast = os.clock()
+						elseif st == "Reel" and State.fish.autoReel then
+							task.wait(State.fish.reelWait)
+							if rod.Parent and rod:GetAttribute("FishState") == "Reel" then
+								HUB.Fire("Fishing", "Reel", true)
+								Fish.caught = Fish.caught + 1
+								UI.setStatus("🎣 ตกได้! (รวม " .. Fish.caught .. " ตัว)", "#9be86a")
+								HUB.Notify("ตกปลาสำเร็จ ตัวที่ " .. Fish.caught, "ok")
+							end
+						elseif (not st) and State.fish.autoCast and (os.clock() - Fish.lastCast) > State.fish.castDelay then
+							Fish.cast()
+						end
+					end
+				end)
+			end
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  10) FEATURE: 🎁 ของรางวัล / เคลมอัตโนมัติ
+-- ══════════════════════════════════════════════════════════════
+local Rewards = {}
+HUB.Rewards = Rewards
+Rewards.lastAuto = 0
+
+local RewardActions = {
+	{ id = "ClaimDaily",   name = "รับของประจำวัน",   icon = "📅" },
+	{ id = "ClaimGroup",   name = "รับของฟรี (กลุ่ม)",  icon = "👥" },
+	{ id = "ClaimPlay",    name = "รับรางวัลเวลาเล่น", icon = "⏱️" },
+	{ id = "Spin",         name = "หมุนวงล้อ",          icon = "🎡" },
+	{ id = "SupremeSpin",  name = "หมุนวงล้อพรีเมียม",  icon = "💎" },
+}
+
+function Rewards.fire(action, arg)
+	local rem = HUB.Remote("Rewards")
+	if not rem then return false end
+	local ok = pcall(function()
+		if action == "ClaimPlay" and arg == nil then
+			for i = 1, 8 do rem:FireServer(action, i) task.wait(0.06) end
+		elseif arg ~= nil then
+			rem:FireServer(action, arg)
+		else
+			rem:FireServer(action)
+		end
+	end)
+	if ok then UI.setStatus("🎁 สั่ง " .. action .. " แล้ว", "#ffd45e") end
+	return ok
+end
+
+function Rewards.claimAll()
+	local done = 0
+	for _, a in ipairs({ "ClaimDaily", "ClaimGroup", "ClaimPlay" }) do
+		if Rewards.fire(a) then done = done + 1 end
+		task.wait(0.25)
+	end
+	HUB.Notify("กดรับรางวัลแล้ว " .. done .. " รายการ", "ok")
+	return done
+end
+
+function Rewards.loop()
+	task.spawn(function()
+		while HUB.Alive and task.wait(1) do
+			if State.reward.auto and (os.clock() - Rewards.lastAuto) >= State.reward.every then
+				Rewards.lastAuto = os.clock()
+				pcall(Rewards.claimAll)
+			end
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  11) FEATURE: 👁 ESP
+-- ══════════════════════════════════════════════════════════════
+local ESP = {}
+HUB.ESP = ESP
+ESP.holder = nil
+ESP.items = {}   -- [kind] = { [instance] = {hl=, bb=, label=} }
+
+local EspStyle = {
+	fruit   = { color = Color3.fromRGB(255, 225, 90),  name = "ผลสุก",   icon = "🍈" },
+	plot    = { color = Color3.fromRGB(95, 225, 45),   name = "แปลงปลูก", icon = "🌱" },
+	npc     = { color = Color3.fromRGB(120, 200, 255), name = "NPC",     icon = "🧑‍🌾" },
+	vehicle = { color = Color3.fromRGB(255, 170, 80),  name = "รถ",      icon = "🚚" },
+	player  = { color = Color3.fromRGB(255, 90, 120),  name = "ผู้เล่น",  icon = "👤" },
+	chest   = { color = Color3.fromRGB(200, 140, 255), name = "หีบ/คลัง", icon = "📦" },
+	pond    = { color = Color3.fromRGB(80, 190, 255),  name = "บ่อปลา",   icon = "🎣" },
+}
+
+function ESP.ensureHolder()
+	if ESP.holder and ESP.holder.Parent then return ESP.holder end
+	ESP.holder = new("Folder", { Name = "HubESP" }, Workspace)
+	return ESP.holder
+end
+
+function ESP.add(kind, inst, part, text)
+	if not (inst and inst.Parent) then return end
+	ESP.items[kind] = ESP.items[kind] or {}
+	if ESP.items[kind][inst] then return end
+	local style = EspStyle[kind] or EspStyle.fruit
+	local holder = ESP.ensureHolder()
+	local adornee = part or inst
+	if not (adornee and adornee:IsA("BasePart")) then
+		adornee = (inst:IsA("Model") and inst:FindFirstChildWhichIsA("BasePart", true)) or adornee
+	end
+	local hlAdornee = inst
+	local hl = new("Highlight", {
+		Adornee = hlAdornee, FillColor = style.color, OutlineColor = Color3.new(1, 1, 1),
+		FillTransparency = 0.72, OutlineTransparency = 0.15,
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Parent = holder,
+	})
+	local bb = new("BillboardGui", {
+		Adornee = adornee, Size = UDim2.fromOffset(220, 40), StudsOffsetWorldSpace = Vector3.new(0, 2.4, 0),
+		AlwaysOnTop = true, BackgroundTransparency = 1, Parent = holder,
+	})
+	local lbl = new("TextLabel", {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Theme.ink, BackgroundTransparency = 0.25,
+		Text = text or style.name, TextColor3 = style.color, TextSize = 13,
+		Font = Enum.Font.GothamBold, RichText = true, TextWrapped = false, Parent = bb,
+	})
+	new("UICorner", { CornerRadius = UDim.new(0, 8) }, lbl)
+	new("UIStroke", { Color = style.color, Thickness = 1, Transparency = 0.4 }, lbl)
+	ESP.items[kind][inst] = { hl = hl, bb = bb, label = lbl, baseText = text or style.name, adornee = adornee }
+end
+
+function ESP.remove(kind, inst)
+	local set = ESP.items[kind]
+	if not (set and set[inst]) then return end
+	local rec = set[inst]
+	if rec.hl then rec.hl:Destroy() end
+	if rec.bb then rec.bb:Destroy() end
+	set[inst] = nil
+end
+
+function ESP.clear(kind)
+	local set = ESP.items[kind]
+	if not set then return end
+	for inst in pairs(set) do ESP.remove(kind, inst) end
+	ESP.items[kind] = {}
+end
+
+function ESP.clearAll()
+	for kind in pairs(EspStyle) do ESP.clear(kind) end
+end
+
+function ESP.collect(kind)
+	local out = {}
+	if kind == "fruit" then
+		for _, fruit in ipairs(CollectionService:GetTagged("DurianFruit")) do
+			local prompt, part = World.ripePromptOf(fruit)
+			if prompt then
+				local mine = World.isMine(fruit)
+				table.insert(out, { inst = fruit, part = part, text = "🍈 ทุเรียนสุก" .. (mine and " (ของเรา)" or " (คนอื่น)") })
+			end
+		end
+	elseif kind == "plot" then
+		for _, s in ipairs(World.plantSpots(State.farm.onlyMine, 1e9)) do
+			table.insert(out, { inst = s.parent or s.spot, part = s.spot, text = "🌱 แปลงปลูก" })
+		end
+	elseif kind == "npc" then
+		for _, n in ipairs(CollectionService:GetTagged("TalkNPC")) do
+			table.insert(out, { inst = n, text = "🧑‍🌾 NPC" })
+		end
+	elseif kind == "chest" then
+		for _, c in ipairs(CollectionService:GetTagged("StorageChest")) do
+			table.insert(out, { inst = c, text = "📦 คลังเก็บของ" })
+		end
+	elseif kind == "vehicle" then
+		local map = Workspace:FindFirstChild("Map") or Workspace
+		for _, d in ipairs(map:GetChildren()) do
+			if d:IsA("Model") and d:GetAttribute("VehicleId") then
+				table.insert(out, { inst = d, text = "🚚 " .. tostring(d:GetAttribute("VehicleId")) })
+			end
+		end
+	elseif kind == "player" then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player and p.Character then
+				local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+				table.insert(out, { inst = p.Character, part = hrp, text = "👤 " .. p.Name })
+			end
+		end
+	elseif kind == "pond" then
+		local pc, pr = World.pond()
+		if pc then table.insert(out, { inst = player, part = nil, text = "🎣 บ่อปลา (r=" .. math.floor(pr or 0) .. ")", pos = pc }) end
+	end
+	return out
+end
+
+function ESP.refresh()
+	for kind in pairs(EspStyle) do
+		if State.esp[kind] then
+			local seen = {}
+			local list = ESP.collect(kind)
+			for _, e in ipairs(list) do
+				if e.inst and e.inst.Parent then
+					seen[e.inst] = true
+					if kind == "pond" and e.pos then
+						if not ESP.pondMarker or not ESP.pondMarker.Parent then
+							ESP.pondMarker = new("Part", {
+								Name = "HubPondMarker", Anchored = true, CanCollide = false, CanQuery = false,
+								CanTouch = false, Transparency = 1, Size = Vector3.new(4, 1, 4), Parent = ESP.ensureHolder(),
+							})
+						end
+						ESP.pondMarker.CFrame = CFrame.new(e.pos)
+						ESP.add(kind, player, ESP.pondMarker, e.text)
+					else
+						local part = e.part
+						if not part and e.inst:IsA("Model") then
+							part = e.inst:FindFirstChildWhichIsA("BasePart", true)
+						end
+						ESP.add(kind, e.inst, part or e.inst, e.text)
+					end
+				end
+			end
+			local set = ESP.items[kind]
+			if set then
+				for inst in pairs(set) do
+					if not seen[inst] or not inst.Parent then ESP.remove(kind, inst) end
+				end
+			end
+		else
+			ESP.clear(kind)
+		end
+	end
+end
+
+-- ESP ผู้เล่น (ติดตามตอนเกิดใหม่)
+function ESP.watchPlayers()
+	local function hookChar(p)
+		if p == player then return end
+		local function onChar(char)
+			task.wait(0.6)
+			if State.esp.player and char and char.Parent then
+				local hrp = char:FindFirstChild("HumanoidRootPart")
+				ESP.add("player", char, hrp or char, "👤 " .. p.Name)
+			end
+		end
+		if p.Character then onChar(p.Character) end
+		track(p.CharacterAdded:Connect(onChar))
+	end
+	for _, p in ipairs(Players:GetPlayers()) do hookChar(p) end
+	track(Players.PlayerAdded:Connect(hookChar))
+end
+
+function ESP.loop()
+	task.spawn(function()
+		while HUB.Alive do
+			pcall(ESP.refresh)
+			task.wait(1.6)
+		end
+	end)
+	-- อัปเดตระยะทาง 6 ครั้ง/วินาที
+	task.spawn(function()
+		while HUB.Alive and task.wait(0.16) do
+			if State.esp.distance then
+				local myPos = World.pos()
+				if myPos then
+					for kind, set in pairs(ESP.items) do
+						for _, rec in pairs(set) do
+							if rec.label and rec.label.Parent and rec.adornee and rec.adornee.Parent then
+								local ok, p = pcall(function()
+									if rec.adornee:IsA("Model") then return rec.adornee:GetPivot().Position end
+									return rec.adornee.Position
+								end)
+								if ok and p then
+									rec.label.Text = rec.baseText .. "  <font color=\"#ffffff\">" .. math.floor((p - myPos).Magnitude) .. "m</font>"
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  12) FEATURE: ⚡ ตัวละคร (Fly / NoClip / Speed / Infinite Jump)
+-- ══════════════════════════════════════════════════════════════
+local Mods = {}
+HUB.Mods = Mods
+Mods.upHeld, Mods.downHeld = false, false
+Mods.flyParts = {}
+Mods.savedSpeed = nil
+
+function Mods.applyStats()
+	local hum = World.hum()
+	if not hum then return end
+	pcall(function() hum.WalkSpeed = State.playerMods.walkSpeed end)
+	pcall(function()
+		if hum.UseJumpPower then hum.JumpPower = State.playerMods.jumpPower
+		else hum.JumpHeight = State.playerMods.jumpPower / 4 end
+	end)
+end
+
+function Mods.statLoop()
+	task.spawn(function()
+		while HUB.Alive and task.wait(0.5) do
+			if State.playerMods.lockStats then pcall(Mods.applyStats) end
+		end
+	end)
+	track(player.CharacterAdded:Connect(function()
+		task.wait(0.6)
+		pcall(Mods.applyStats)
+		if State.playerMods.fly then Mods.startFly() end
+	end))
+end
+
+-- ── Fly ──
+function Mods.startFly()
+	local hrp = World.hrp()
+	if not hrp then HUB.Notify("ยังไม่พร้อม (ไม่มีตัวละคร)", "warn") return false end
+	Mods.stopFly(true)
+	local att = new("Attachment", { Name = "HubFlyAtt" }, hrp)
+	local velObj = nil
+	local okLV, lv = pcall(function()
+		local v = Instance.new("LinearVelocity")
+		v.Attachment0 = att
+		v.MaxForce = math.huge
+		v.RelativeTo = Enum.ActuatorRelativeTo.World
+		v.VectorVelocity = Vector3.new(0, 0, 0)
+		v.Parent = hrp
+		return v
+	end)
+	if okLV and lv then
+		velObj = lv
+	else
+		local okBV, bv = pcall(function()
+			local b = Instance.new("BodyVelocity")
+			b.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+			b.P = 1e4
+			b.Velocity = Vector3.new(0, 0, 0)
+			b.Parent = hrp
+			return b
+		end)
+		if okBV then velObj = bv end
+	end
+	Mods.flyParts = { att = att, vel = velObj, isLV = (velObj == lv) }
+	Mods.flyConn = track(RunService.RenderStepped:Connect(function()
+		if not State.playerMods.fly then return end
+		local h = World.hrp()
+		if not h then return end
+		local hum = World.hum()
+		local md = (hum and hum.MoveDirection) or Vector3.new(0, 0, 0)
+		local spd = State.playerMods.flySpeed
+		local dir = Vector3.new(md.X, 0, md.Z)
+		if dir.Magnitude > 1 then dir = dir.Unit end
+		local up = (Mods.upHeld and 1 or 0) - (Mods.downHeld and 1 or 0)
+		local target = dir * spd + Vector3.new(0, up * spd, 0)
+		local v = Mods.flyParts.vel
+		if v and v.Parent then
+			if Mods.flyParts.isLV then v.VectorVelocity = target else v.Velocity = target end
+		else
+			pcall(function() h.AssemblyLinearVelocity = target end)
+		end
+	end))
+	State.playerMods.fly = true
+	if UI.FlyPad then UI.FlyPad.Visible = true end
+	UI.setStatus("🕊️ Fly เปิดอยู่ (ใช้ปุ่ม ▲▼ บินขึ้น/ลง)", "#7fd4ff")
+	HUB.Notify("เปิด Fly แล้ว", "ok")
+	return true
+end
+
+function Mods.stopFly(silent)
+	State.playerMods.fly = false
+	if Mods.flyConn then pcall(function() Mods.flyConn:Disconnect() end) Mods.flyConn = nil end
+	for _, key in ipairs({ "att", "vel" }) do
+		local o = Mods.flyParts[key]
+		if o and o.Parent then o:Destroy() end
+	end
+	Mods.flyParts = {}
+	local hrp = World.hrp()
+	if hrp then pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end) end
+	if UI.FlyPad then UI.FlyPad.Visible = false end
+	Mods.upHeld, Mods.downHeld = false, false
+	if not silent then HUB.Notify("ปิด Fly แล้ว", "info") end
+end
+
+function Mods.wireFlyButtons()
+	if not (UI.FlyUp and UI.FlyDown) then return end
+	local function wire(btn, isUp)
+		track(btn.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+				if isUp then Mods.upHeld = true else Mods.downHeld = true end
+				HUB.Tween(btn, 0.1, { BackgroundColor3 = HUB.Accent })
+			end
+		end))
+		track(btn.InputEnded:Connect(function()
+			if isUp then Mods.upHeld = false else Mods.downHeld = false end
+			HUB.Tween(btn, 0.18, { BackgroundColor3 = Theme.body })
+		end))
+	end
+	wire(UI.FlyUp, true)
+	wire(UI.FlyDown, false)
+end
+
+-- ── NoClip ──
+function Mods.startNoClip()
+	Mods.noClipConn = track(RunService.Heartbeat:Connect(function()
+		if not State.playerMods.noClip then return end
+		local char = World.char()
+		if char then
+			for _, d in ipairs(char:GetDescendants()) do
+				if d:IsA("BasePart") then pcall(function() d.CanCollide = false end) end
+			end
+		end
+	end))
+	UI.setStatus("👻 NoClip เปิด (เดินทะลุสิ่งของได้)", "#c084ff")
+end
+
+function Mods.stopNoClip()
+	if Mods.noClipConn then pcall(function() Mods.noClipConn:Disconnect() end) Mods.noClipConn = nil end
+end
+
+-- ── Infinite Jump ──
+function Mods.wireInfJump()
+	track(UserInputService.JumpRequest:Connect(function()
+		if not State.playerMods.infJump then return end
+		local hum = World.hum()
+		if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end) end
+	end))
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  13) FEATURE: 🧭 เทเลพอร์ต
+-- ══════════════════════════════════════════════════════════════
+local TP = {}
+HUB.TP = TP
+
+function TP.toPos(pos, label)
+	if not pos then HUB.Notify("หาจุดหมายไม่เจอ", "warn") return false end
+	World.teleportTo(pos, 3.5)
+	UI.setStatus("🧭 วาร์ปไป " .. tostring(label or "จุดหมาย"), "#c084ff")
+	return true
+end
+
+function TP.base()
+	local b = World.myBase()
+	if not b then HUB.Notify("ยังไม่พบสวนของคุณ", "warn") return end
+	local ok, pivot = pcall(function() return b:GetPivot() end)
+	TP.toPos(ok and pivot.Position or nil, "สวนของฉัน")
+end
+
+function TP.well()
+	TP.toPos(World.wellPos(), "บ่อน้ำ")
+end
+
+function TP.pond()
+	local c = World.pond()
+	TP.toPos(c, "บ่อปลา")
+end
+
+function TP.truck()
+	local map = Workspace:FindFirstChild("Map") or Workspace
+	for _, d in ipairs(map:GetDescendants()) do
+		if d:IsA("Model") and d:GetAttribute("VehicleId") and d:GetAttribute("OwnerUserId") == player.UserId then
+			local ok, pivot = pcall(function() return d:GetPivot() end)
+			if ok then TP.toPos(pivot.Position + Vector3.new(0, 3, 0), "รถของฉัน") return end
+		end
+	end
+	HUB.Notify("ไม่พบรถของคุณ (ลองเปิดโรงรถก่อน)", "warn")
+end
+
+function TP.spawn()
+	TP.toPos(World.spawnPoint(), "จุดเกิด")
+end
+
+function TP.nearestFruit()
+	local list = World.harvestTargets(false, 1e9)
+	if #list == 0 then HUB.Notify("ไม่มีผลสุกให้วาร์ปไป", "warn") return end
+	table.sort(list, function(a, b) return a.dist < b.dist end)
+	TP.toPos(list[1].pos, "ผลสุกที่ใกล้ที่สุด")
+end
+
+function TP.saveHere(name)
+	local pos = World.pos()
+	if not pos then return false end
+	name = name or ("จุดที่ " .. (#State.teleport.saved + 1))
+	table.insert(State.teleport.saved, { name = name, x = pos.X, y = pos.Y, z = pos.Z })
+	if HUB.Config2 then HUB.Config2.save() end
+	return true
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  14) CONFIG (บันทึก/โหลดด้วย writefile ถ้า executor รองรับ)
+-- ══════════════════════════════════════════════════════════════
+local Config = {}
+HUB.Config2 = Config
+Config.fileName = "DurianFarmHub_Config.json"
+Config.canFile = (typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function")
+
+function Config.serialize()
+	return {
+		ui = State.ui, farm = State.farm, fish = State.fish, reward = State.reward,
+		esp = State.esp, playerMods = State.playerMods,
+		saved = State.teleport.saved,
+		version = HUB.Version,
+	}
+end
+
+function Config.save()
+	if not State.ui.autoSave or not Config.canFile then return false end
+	local ok, json = pcall(function() return HttpService:JSONEncode(Config.serialize()) end)
+	if not ok then return false end
+	pcall(function() writefile(Config.fileName, json) end)
+	return true
+end
+
+function Config.load()
+	if not Config.canFile then return false end
+	local exists = false
+	pcall(function() exists = isfile(Config.fileName) end)
+	if not exists then return false end
+	local content
+	pcall(function() content = readfile(Config.fileName) end)
+	if not content then return false end
+	local ok, data = pcall(function() return HttpService:JSONDecode(content) end)
+	if not (ok and type(data) == "table") then return false end
+	for _, section in ipairs({ "ui", "farm", "fish", "reward", "esp", "playerMods" }) do
+		if type(data[section]) == "table" then
+			for k, v in pairs(data[section]) do
+				if State[section][k] ~= nil and type(State[section][k]) == type(v) then
+					State[section][k] = v
+				end
+			end
+		end
+	end
+	if type(data.saved) == "table" then
+		State.teleport.saved = {}
+		for _, s in ipairs(data.saved) do
+			if type(s) == "table" and s.name and s.x then
+				table.insert(State.teleport.saved, { name = s.name, x = s.x, y = s.y, z = s.z })
+			end
+		end
+	end
+	return true
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  15) DESTROY
+-- ══════════════════════════════════════════════════════════════
+function HUB.Destroy(reason)
+	HUB.Alive = false
+	pcall(function() Mods.stopFly(true) end)
+	pcall(function() Mods.stopNoClip() end)
+	pcall(function() ESP.clearAll() end)
+	if ESP.holder then pcall(function() ESP.holder:Destroy() end) end
+	pcall(Config.save)
+	for _, c in ipairs(HUB.Conns) do pcall(function() c:Disconnect() end) end
+	HUB.Conns = {}
+	if UI.Root then pcall(function() UI.Root:Destroy() end) end
+	Global.__DURIAN_HUB = nil
+	print("[สวนทุเรียน HUB] ปิดสคริปต์แล้ว " .. tostring(reason or ""))
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  16) AUTO EQUIP LOOP
+-- ══════════════════════════════════════════════════════════════
+function Mods.autoEquipLoop()
+	task.spawn(function()
+		while HUB.Alive and task.wait(1) do
+			pcall(function()
+				local char = World.char()
+				if not char then return end
+				local equipped = char:FindFirstChildOfClass("Tool")
+				if State.playerMods.autoEquipRod and State.fish.auto then
+					if not (equipped and equipped:GetAttribute("GearId") == "Rod") then
+						local rod = World.toolByGear("Rod")
+						if rod then World.equip(rod) end
+					end
+				elseif State.playerMods.autoEquipCan and State.farm.master and State.farm.water then
+					if not (equipped and equipped:GetAttribute("GearId") == "WateringCan") then
+						local can = World.toolByGear("WateringCan")
+						if can then World.equip(can) end
+					end
+				end
+			end)
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  17) สร้างหน้า UI ทั้งหมด
+-- ══════════════════════════════════════════════════════════════
+local function listContainer(page, order)
+	local f = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1, LayoutOrder = order or #page.page:GetChildren(),
+	}, page.page)
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, f)
+	return f
+end
+
+local function listButton(container, text, icon, cb, order, color, color2)
+	local b = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = color or HUB.Accent, BorderSizePixel = 0,
+		Text = (icon and icon .. "  " or "") .. tostring(text), TextColor3 = Color3.new(1, 1, 1),
+		TextSize = 13, Font = Enum.Font.GothamBold, AutoButtonColor = false, Active = true,
+		LayoutOrder = order or #container:GetChildren(),
+	}, container)
+	corner(12, b)
+	gradient(color or HUB.Accent, color2 or HUB.AccentDk, 90, b)
+	stroke(Theme.ink, 1, 0.6, b)
+	HUB.Springy(b, 1.02, 0.95)
+	if not color then UI.registerAccent(b) end
+	track(b.Activated:Connect(function()
+		if cb then
+			local ok, err = pcall(cb)
+			if not ok then HUB.Log("ปุ่มผิดพลาด: " .. tostring(err), "error") end
+		end
+	end))
+	return b
+end
+
+-- ─────────────── TAB 1 : ฟาร์ม ───────────────
+local function buildFarmTab()
+	local page = UI.addTab("farm", "🌾", "ฟาร์ม")
+	W.section(page, "สวิตช์หลัก")
+	local master = W.toggle(page, {
+		name = "ออโต้ฟาร์มทั้งหมด", icon = "🚀", desc = "เก็บเกี่ยว → รดน้ำ → ขาย → Rebirth วนอัตโนมัติ",
+		default = State.farm.master,
+		callback = function(v)
+			State.farm.master = v
+			HUB.Notify(v and "เปิดออโต้ฟาร์มแล้ว 🌾" or "ปิดออโต้ฟาร์ม", v and "ok" or "info")
+			if UI.StatusDot then HUB.Tween(UI.StatusDot, 0.25, { BackgroundColor3 = v and Theme.green or Theme.off }) end
+			Config.save()
+		end,
+	})
+	HUB.MasterToggle = master
+	local stats = W.label(page, "กำลังโหลด...", { bg = Theme.track, height = 44, size = 12, color = Theme.text })
+	HUB.FarmStatsLabel = stats
+
+	W.section(page, "ระบบย่อย")
+	W.toggle(page, { name = "เก็บเกี่ยวอัตโนมัติ", icon = "🍈", default = State.farm.harvest,
+		callback = function(v) State.farm.harvest = v Config.save() end })
+	W.toggle(page, { name = "รดน้ำอัตโนมัติ", icon = "💧", desc = "ต้องถือบัวรดน้ำ + มีน้ำ",
+		default = State.farm.water, callback = function(v) State.farm.water = v Config.save() end })
+	W.toggle(page, { name = "เติมน้ำที่บ่ออัตโนมัติ", icon = "🪣", default = State.farm.refill,
+		callback = function(v) State.farm.refill = v Config.save() end })
+	W.toggle(page, { name = "ขายขึ้นรถบรรทุก", icon = "🚚", desc = "เมื่อนั่งบนรถของตัวเอง",
+		default = State.farm.sellTruck, callback = function(v) State.farm.sellTruck = v Config.save() end })
+	W.toggle(page, { name = "ขายที่แผง (ทุเรียน/ยาง/ปาล์ม)", icon = "🏪", default = State.farm.sellStall,
+		callback = function(v) State.farm.sellStall = v Config.save() end })
+	W.toggle(page, { name = "Rebirth อัตโนมัติ", icon = "🔮", desc = "กดให้เมื่อเงินพอ",
+		default = State.farm.rebirth, callback = function(v) State.farm.rebirth = v Config.save() end })
+	W.toggle(page, { name = "รับทุเรียนร่วง (Catch)", icon = "🧺", default = State.farm.autoCatch,
+		callback = function(v) State.farm.autoCatch = v Config.save() end })
+	W.toggle(page, { name = "เฉพาะสวนของฉัน", icon = "🏡", desc = "ปิด = เก็บ/รดน้ำสวนคนอื่นได้ด้วย",
+		default = State.farm.onlyMine, callback = function(v) State.farm.onlyMine = v Config.save() end })
+	W.toggle(page, { name = "วาร์ปไปหาเป้าหมาย", icon = "⚡", desc = "ปิด = เดินไปเอง (ดูเนียนกว่า)",
+		default = State.farm.tpToTarget, callback = function(v) State.farm.tpToTarget = v Config.save() end })
+
+	W.section(page, "ปรับระยะ/ความเร็ว")
+	W.slider(page, { name = "ระยะค้นหาสูงสุด", icon = "📏", min = 10, max = 400, default = State.farm.reachDist,
+		suffix = " m", callback = function(v) State.farm.reachDist = v Config.save() end })
+	W.slider(page, { name = "ระยะยืนกด", icon = "🧍", min = 2, max = 20, default = State.farm.standDist,
+		suffix = " m", callback = function(v) State.farm.standDist = v Config.save() end })
+	W.slider(page, { name = "หน่วงระหว่างเก็บ", icon = "⏱️", min = 0.05, max = 2, decimals = 2,
+		default = State.farm.harvestDelay, suffix = " s", callback = function(v) State.farm.harvestDelay = v Config.save() end })
+	W.slider(page, { name = "หน่วงระหว่างรดน้ำ", icon = "⏱️", min = 0.1, max = 3, decimals = 2,
+		default = State.farm.waterDelay, suffix = " s", callback = function(v) State.farm.waterDelay = v Config.save() end })
+	W.slider(page, { name = "พักต่อรอบ", icon = "😴", min = 0.2, max = 10, decimals = 1,
+		default = State.farm.cycleDelay, suffix = " s", callback = function(v) State.farm.cycleDelay = v Config.save() end })
+	W.slider(page, { name = "ตรวจ Rebirth ทุก", icon = "🔮", min = 5, max = 300, default = State.farm.rebirthEvery,
+		suffix = " s", callback = function(v) State.farm.rebirthEvery = v Config.save() end })
+
+	W.section(page, "กดเองทีละครั้ง")
+	local manual = listContainer(page)
+	listButton(manual, "เก็บเกี่ยวรอบนี้", "🍈", function()
+		local n = Farm.harvestOnce(999)
+		HUB.Notify(n > 0 and ("เก็บไป " .. n .. " ผล") or "ไม่มีผลสุกให้เก็บ", n > 0 and "ok" or "warn")
+	end)
+	listButton(manual, "รดน้ำรอบนี้", "💧", function()
+		local n = Farm.waterOnce()
+		HUB.Notify(n > 0 and ("รดน้ำ " .. n .. " แปลง") or "รดน้ำไม่ได้ (ดูที่แถบสถานะ)", n > 0 and "ok" or "warn")
+	end)
+	listButton(manual, "เติมน้ำที่บ่อ", "🪣", function() Farm.refillWater() end)
+	listButton(manual, "ขายขึ้นรถ", "🚚", function()
+		if not Farm.sellTruck() then HUB.Notify("ต้องนั่งบนรถบรรทุกของตัวเองก่อน", "warn") end
+	end)
+	listButton(manual, "ขายที่แผง", "🏪", function() Farm.sellStall() end)
+	listButton(manual, "Rebirth ตอนนี้เลย", "🔮", function()
+		if not Farm.tryRebirth(true) then HUB.Notify("Rebirth ไม่สำเร็จ (เงินไม่ถึง/เต็มแล้ว)", "warn") end
+	end, nil, Theme.purple, Theme.purpleDark)
+	listButton(manual, "วางของที่ถืออยู่", "🧺", function()
+		HUB.Fire("PutDownLoot")
+		HUB.Notify("สั่งวางของแล้ว", "info")
+	end, nil, Theme.off, Color3.fromRGB(50, 50, 60))
+
+	-- อัปเดตสถิติ
+	task.spawn(function()
+		while HUB.Alive and task.wait(0.6) do
+			if stats.Parent then
+				local s = Farm.stats
+				stats.Text = string.format(
+					'<font color="#9be86a">🍈 เก็บ %d</font>  <font color="#7fd4ff">💧 รด %d</font>  <font color="#ffd45e">🏪 ขาย %d</font>\n<font color="#c084ff">🔮 Rebirth %d</font>  <font color="#ffffff">💰 %s</font>  <font color="#aaaaaa">ค่าน้ำ %d</font>',
+					s.harvested, s.watered, s.sold, s.rebirths, tostring(World.cash()),
+					tonumber(player:GetAttribute("WaterUses")) or 0
+				)
+				stats.Size = UDim2.new(1, 0, 0, 46)
+			end
+		end
+	end)
+	return page, master
+end
+
+-- ─────────────── TAB 2 : ตกปลา ───────────────
+local function buildFishTab()
+	local page = UI.addTab("fish", "🎣", "ตกปลา")
+	W.section(page, "ออโต้ตกปลา")
+	W.toggle(page, { name = "ตกปลาอัตโนมัติ", icon = "🎣", desc = "โยนเบ็ด → วัด → ดึง ขึ้นให้อัตโนมัติ",
+		default = State.fish.auto,
+		callback = function(v) State.fish.auto = v HUB.Notify(v and "เปิดออโต้ตกปลา 🎣" or "ปิดออโต้ตกปลา", v and "ok" or "info") Config.save() end })
+	W.toggle(page, { name = "โยนเบ็ดอัตโนมัติ", icon = "🪝", default = State.fish.autoCast,
+		callback = function(v) State.fish.autoCast = v Config.save() end })
+	W.toggle(page, { name = "วัดเบ็ดอัตโนมัติ (ตอนปลากิน)", icon = "⚡", default = State.fish.autoHook,
+		callback = function(v) State.fish.autoHook = v Config.save() end })
+	W.toggle(page, { name = "ดึงปลาอัตโนมัติ (ชนะมินิเกม)", icon = "🐟", default = State.fish.autoReel,
+		callback = function(v) State.fish.autoReel = v Config.save() end })
+	W.toggle(page, { name = "วาร์ปไปบ่อปลาอัตโนมัติ", icon = "🧭", default = State.fish.tpToPond,
+		callback = function(v) State.fish.tpToPond = v Config.save() end })
+	W.toggle(page, { name = "เลือกเหยื่ออัตโนมัติ", icon = "🪱", default = State.fish.baitAuto,
+		callback = function(v) State.fish.baitAuto = v Config.save() end })
+
+	W.section(page, "เหยื่อ / จังหวะ")
+	local baitOptions = {}
+	local fcfg = HUB.Config("FishingConfig")
+	if fcfg and fcfg.Baits then
+		for _, b in ipairs(fcfg.Baits) do
+			table.insert(baitOptions, { id = b.Id, name = (b.Name or b.Id) .. "  (" .. tostring(b.Rarity or "-") .. ")" })
+		end
+	end
+	if #baitOptions == 0 then baitOptions = { { id = "Worm", name = "Worm" }, { id = "Shrimp", name = "Shrimp" }, { id = "Golden", name = "Golden Lure" } } end
+	W.dropdown(page, { name = "🪱 เหยื่อที่ใช้", options = baitOptions, default = State.fish.bait,
+		callback = function(v) State.fish.bait = v State.fish.baitAuto = false Config.save() end })
+	W.slider(page, { name = "หน่วงก่อนโยนเบ็ดใหม่", icon = "⏱️", min = 0.5, max = 8, decimals = 1,
+		default = State.fish.castDelay, suffix = " s", callback = function(v) State.fish.castDelay = v Config.save() end })
+	W.slider(page, { name = "หน่วงก่อนดึงปลา", icon = "🎣", min = 0, max = 5, decimals = 1,
+		default = State.fish.reelWait, suffix = " s", callback = function(v) State.fish.reelWait = v Config.save() end })
+
+	W.section(page, "สถานะ")
+	local fishStatus = W.label(page, "...", { bg = Theme.track, height = 46, color = Theme.text })
+	task.spawn(function()
+		while HUB.Alive and task.wait(0.7) do
+			if fishStatus.Parent then
+				local cnt = tonumber(player:GetAttribute("FishCount")) or 0
+				local cap = tonumber(player:GetAttribute("FishCap")) or 0
+				local pond = player:GetAttribute("OwnPond") and "มีบ่อแล้ว" or "ยังไม่มีบ่อปลา"
+				local bait = State.fish.baitAuto and (World.pickBait() or "-") or State.fish.bait
+				local rod = World.toolByGear("Rod")
+				local st = rod and rod:GetAttribute("FishState") or "พร้อม"
+				fishStatus.Text = string.format(
+					'<font color="#7fd4ff">🐟 %d/%d</font>  <font color="#ffd45e">🪱 %s x%d</font>  <font color="#c084ff">🏞️ %s</font>\n<font color="#9be86a">🎣 เบ็ด: %s</font>  <font color="#aaaaaa">สถานะ: %s  •  ตกได้แล้ว %d</font>',
+					cnt, cap, tostring(bait), World.baitCount(bait), pond, rod and "ถืออยู่" or "ไม่พบ", tostring(st), Fish.caught
+				)
+				fishStatus.Size = UDim2.new(1, 0, 0, 46)
+			end
+		end
+	end)
+
+	W.section(page, "กดเอง")
+	local fbtns = listContainer(page)
+	listButton(fbtns, "โยนเบ็ด 1 ครั้ง", "🪝", function()
+		if not Fish.cast() then HUB.Notify("โยนเบ็ดไม่ได้ (ดูแถบสถานะ)", "warn") end
+	end)
+	listButton(fbtns, "วาร์ปไปบ่อปลา", "🧭", function() TP.pond() end, nil, Theme.purple, Theme.purpleDark)
+	listButton(fbtns, "วัดเบ็ดทันที", "⚡", function() HUB.Fire("Fishing", "Hook") end, nil, Theme.gold, Color3.fromRGB(150, 110, 20))
+	listButton(fbtns, "ดึงปลาทันที (ชนะ)", "🐟", function() HUB.Fire("Fishing", "Reel", true) end, nil, Theme.green, Color3.fromRGB(40, 120, 30))
+	return page
+end
+
+-- ─────────────── TAB 3 : รางวัล ───────────────
+local function buildRewardTab()
+	local page = UI.addTab("reward", "🎁", "รางวัล")
+	W.section(page, "กดรับรางวัล")
+	local rbtns = listContainer(page)
+	for _, a in ipairs(RewardActions) do
+		listButton(rbtns, a.name, a.icon, function()
+			Rewards.fire(a.id)
+			HUB.Notify("สั่ง " .. a.name .. " แล้ว", "ok")
+		end)
+	end
+	listButton(rbtns, "กดรับทุกอย่างที่กดได้", "✅", function() Rewards.claimAll() end, nil, Theme.green, Color3.fromRGB(40, 120, 30))
+
+	W.section(page, "เคลมอัตโนมัติ")
+	W.toggle(page, { name = "ออโต้เคลมรางวัล", icon = "🔁", desc = "กดรับของประจำวัน/กลุ่ม/เวลาเล่น ให้อัตโนมัติ",
+		default = State.reward.auto, callback = function(v) State.reward.auto = v Rewards.lastAuto = os.clock() Config.save() end })
+	W.slider(page, { name = "เคลมทุก", icon = "⏱️", min = 60, max = 3600, default = State.reward.every,
+		suffix = " s", callback = function(v) State.reward.every = v Config.save() end })
+	W.label(page, "หมายเหตุ: ระบบจะกดให้ก็ต่อเมื่อเซิร์ฟเวอร์อนุญาต (ของรายวันมีเวลารีเซ็ตของมันเอง)", { height = 30 })
+	return page
+end
+
+-- ─────────────── TAB 4 : ESP ───────────────
+local function buildEspTab()
+	local page = UI.addTab("esp", "👁", "ESP")
+	W.section(page, "มองเห็นผ่านกำแพง")
+	local order = { "fruit", "plot", "npc", "vehicle", "player", "chest", "pond" }
+	for _, kind in ipairs(order) do
+		local st = EspStyle[kind]
+		W.toggle(page, { name = st.name, icon = st.icon, default = State.esp[kind],
+			callback = function(v)
+				State.esp[kind] = v
+				if not v then ESP.clear(kind) else task.spawn(function() pcall(ESP.refresh) end) end
+				Config.save()
+			end })
+	end
+	W.toggle(page, { name = "แสดงระยะห่าง (เมตร)", icon = "📏", default = State.esp.distance,
+		callback = function(v) State.esp.distance = v Config.save() end })
+	W.section(page, "จัดการ")
+	local ebtns = listContainer(page)
+	listButton(ebtns, "รีเฟรช ESP ตอนนี้", "🔄", function() pcall(ESP.refresh) HUB.Notify("รีเฟรช ESP แล้ว", "ok") end)
+	listButton(ebtns, "ปิด ESP ทั้งหมด", "🧹", function()
+		for k in pairs(EspStyle) do State.esp[k] = false end
+		ESP.clearAll()
+		HUB.Notify("ปิด ESP ทั้งหมดแล้ว", "info")
+		Config.save()
+	end, nil, Theme.red, Color3.fromRGB(120, 20, 20))
+	W.label(page, "ESP ใช้ Highlight + ป้ายลอย ถ้าเกมมีวัตถุเยอะอาจกินสเปกเครื่องมือถือ ให้เปิดเท่าที่จำเป็น", { height = 34 })
+	return page
+end
+
+-- ─────────────── TAB 5 : วาร์ป ───────────────
+local function buildTpTab()
+	local page = UI.addTab("tp", "🧭", "วาร์ป")
+	W.section(page, "จุดหลัก")
+	local main = listContainer(page)
+	listButton(main, "สวน/บ้านของฉัน", "🏡", function() TP.base() end)
+	listButton(main, "บ่อน้ำ", "🪣", function() TP.well() end)
+	listButton(main, "บ่อปลา", "🎣", function() TP.pond() end)
+	listButton(main, "รถบรรทุกของฉัน", "🚚", function() TP.truck() end)
+	listButton(main, "จุดเกิด", "🌍", function() TP.spawn() end)
+	listButton(main, "ผลสุกที่ใกล้ที่สุด", "🍈", function() TP.nearestFruit() end, nil, Theme.green, Color3.fromRGB(40, 120, 30))
+
+	W.section(page, "จุดที่บันทึกไว้")
+	local savedBox = listContainer(page)
+	local function refreshSaved()
+		for _, c in ipairs(savedBox:GetChildren()) do
+			if c:IsA("TextButton") or c:IsA("TextLabel") or c:IsA("Frame") then c:Destroy() end
+		end
+		if #State.teleport.saved == 0 then
+			local l = new("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Text = "ยังไม่มีจุดบันทึก",
+				TextColor3 = Theme.muted, TextSize = 12, Font = Enum.Font.Gotham, LayoutOrder = 0,
+			}, savedBox)
+		else
+			for i, s in ipairs(State.teleport.saved) do
+				listButton(savedBox, s.name, "📍", function()
+					TP.toPos(Vector3.new(s.x, s.y, s.z), s.name)
+				end, i, Theme.purple, Theme.purpleDark)
+			end
+		end
+	end
+	refreshSaved()
+	local saveBtns = listContainer(page)
+	listButton(saveBtns, "บันทึกตำแหน่งที่ยืนอยู่", "💾", function()
+		TP.saveHere(nil)
+		refreshSaved()
+		HUB.Notify("บันทึกจุดแล้ว (ทั้งหมด " .. #State.teleport.saved .. " จุด)", "ok")
+	end)
+	listButton(saveBtns, "ล้างจุดที่บันทึกทั้งหมด", "🗑️", function()
+		State.teleport.saved = {}
+		refreshSaved()
+		Config.save()
+		HUB.Notify("ล้างจุดบันทึกแล้ว", "info")
+	end, nil, Theme.red, Color3.fromRGB(120, 20, 20))
+
+	W.section(page, "สแกนหาจุดในแมพ")
+	local scanBox = listContainer(page)
+	local scanInfo = W.label(page, "กดปุ่มสแกนเพื่อหา Well / Market / Shop / Garage / Fish / Spawn ฯลฯ ในแมพ", { height = 30 })
+	local scanBtns = listContainer(page)
+	listButton(scanBtns, "🔍 สแกนแมพหาจุดวาร์ป", "🔍", function()
+		scanInfo.Text = "กำลังสแกนแมพ... (อาจใช้เวลา 1-3 วินาที)"
+		task.defer(function()
+			local found = World.scanLandmarks(60)
+			for _, c in ipairs(scanBox:GetChildren()) do
+				if c:IsA("TextButton") then c:Destroy() end
+			end
+			if #found == 0 then
+				scanInfo.Text = "ไม่พบจุดที่เข้าข่ายในแมพ"
+				return
+			end
+			scanInfo.Text = "พบ " .. #found .. " จุด — กดเพื่อวาร์ป"
+			local myPos = World.pos()
+			for i, f in ipairs(found) do
+				local d = myPos and math.floor((f.pos - myPos).Magnitude) or 0
+				listButton(scanBox, f.name .. "  (" .. d .. "m)", "📍", (function(pos, nm)
+					return function() TP.toPos(pos, nm) end
+				end)(f.pos, f.name), i, Theme.row, Theme.ink)
+			end
+		end)
+	end)
+	return page
+end
+
+-- ─────────────── TAB 6 : ผู้เล่น ───────────────
+local function buildPlayerTab()
+	local page = UI.addTab("player", "⚡", "ผู้เล่น")
+	W.section(page, "ค่าตัวละคร")
+	W.slider(page, { name = "ความเร็วเดิน", icon = "🏃", min = 8, max = 300, default = State.playerMods.walkSpeed,
+		callback = function(v) State.playerMods.walkSpeed = v Mods.applyStats() Config.save() end })
+	W.slider(page, { name = "แรงกระโดด", icon = "🦘", min = 0, max = 300, default = State.playerMods.jumpPower,
+		callback = function(v) State.playerMods.jumpPower = v Mods.applyStats() Config.save() end })
+	W.toggle(page, { name = "ล็อคค่า (กันเกมรีเซ็ต)", icon = "🔒", desc = "ตั้งค่าซ้ำทุก 0.5 วิ",
+		default = State.playerMods.lockStats, callback = function(v) State.playerMods.lockStats = v Config.save() end })
+
+	W.section(page, "การบิน / ทะลุสิ่งของ")
+	W.toggle(page, { name = "Fly (บิน)", icon = "🕊️", desc = "มือถือใช้ปุ่ม ▲▼ ด้านขวาจอ",
+		default = State.playerMods.fly,
+		callback = function(v)
+			if v then Mods.startFly() else Mods.stopFly() end
+			Config.save()
+		end })
+	W.slider(page, { name = "ความเร็วบิน", icon = "💨", min = 10, max = 400, default = State.playerMods.flySpeed,
+		callback = function(v) State.playerMods.flySpeed = v Config.save() end })
+	W.toggle(page, { name = "NoClip (เดินทะลุ)", icon = "👻", default = State.playerMods.noClip,
+		callback = function(v)
+			State.playerMods.noClip = v
+			if v then Mods.startNoClip() else Mods.stopNoClip() end
+			Config.save()
+		end })
+	W.toggle(page, { name = "กระโดดไม่จำกัด", icon = "🦘", default = State.playerMods.infJump,
+		callback = function(v) State.playerMods.infJump = v Config.save() end })
+
+	W.section(page, "หยิบอุปกรณ์อัตโนมัติ")
+	W.toggle(page, { name = "หยิบเบ็ดตอนเปิดออโต้ตกปลา", icon = "🎣", default = State.playerMods.autoEquipRod,
+		callback = function(v) State.playerMods.autoEquipRod = v Config.save() end })
+	W.toggle(page, { name = "หยิบบัวรดน้ำตอนฟาร์ม", icon = "💧", default = State.playerMods.autoEquipCan,
+		callback = function(v) State.playerMods.autoEquipCan = v Config.save() end })
+
+	W.section(page, "อื่น ๆ")
+	local pbtns = listContainer(page)
+	listButton(pbtns, "รีเซ็ตค่าตัวละครเป็นปกติ", "♻️", function()
+		State.playerMods.walkSpeed = 16
+		State.playerMods.jumpPower = 50
+		State.playerMods.lockStats = false
+		Mods.applyStats()
+		HUB.Notify("รีเซ็ตค่าตัวละครแล้ว", "ok")
+	end, nil, Theme.off, Color3.fromRGB(50, 50, 60))
+	listButton(pbtns, "เด้งไปจุดเกิด", "🌍", function() TP.spawn() end, nil, Theme.purple, Theme.purpleDark)
+	listButton(pbtns, "กระโดดขึ้นฟ้า 1 ครั้ง", "🚀", function()
+		local hrp = World.hrp()
+		if hrp then pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 120, 0) end) end
+	end, nil, Theme.gold, Color3.fromRGB(150, 110, 20))
+	return page
+end
+
+-- ─────────────── TAB 7 : ตั้งค่า ───────────────
+local function buildSettingsTab()
+	local page = UI.addTab("settings", "⚙️", "ตั้งค่า")
+	W.section(page, "หน้าตา UI")
+	W.slider(page, { name = "ขนาด UI", icon = "🔎", min = 0.7, max = 1.5, decimals = 2, default = State.ui.scale,
+		callback = function(v)
+			State.ui.scale = v
+			if UI.GuiScale then UI.GuiScale.Scale = v end
+			UI.centerWindow()
+			Config.save()
+		end })
+	W.slider(page, { name = "ความเร็ว Tween", icon = "✨", min = 0.5, max = 2.5, decimals = 2, default = State.ui.tweenSpeed,
+		callback = function(v) State.ui.tweenSpeed = v Config.save() end })
+
+	W.label(page, "สีธีม (accent)", { height = 20, color = Theme.muted, size = 11 })
+	local accentBox = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1,
+		LayoutOrder = #page.page:GetChildren(),
+	}, page.page)
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8), HorizontalAlignment = Enum.HorizontalAlignment.Center }, accentBox)
+	for _, a in ipairs(Accents) do
+		local b = new("TextButton", {
+			Size = UDim2.fromOffset(40, 40), BackgroundColor3 = a.color, Text = "", AutoButtonColor = false, Active = true,
+		}, accentBox)
+		corner(12, b)
+		stroke(Theme.ink, 2, 0.4, b)
+		HUB.Springy(b, 1.12, 0.88)
+		local mark = new("TextLabel", {
+			Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", TextColor3 = Color3.new(1, 1, 1),
+			TextSize = 16, Font = Enum.Font.GothamBold, Parent = b,
+		})
+		track(b.Activated:Connect(function()
+			UI.setAccent(a.id)
+			Config.save()
+			HUB.Notify("เปลี่ยนธีมเป็น " .. a.name, "ok")
+		end))
+		if a.id == State.ui.accent then mark.Text = "✓" end
+	end
+
+	W.section(page, "การแจ้งเตือน / เสียง")
+	W.toggle(page, { name = "แสดงการแจ้งเตือน", icon = "🔔", default = State.ui.notify,
+		callback = function(v) State.ui.notify = v Config.save() end })
+	W.toggle(page, { name = "เสียงกดปุ่ม", icon = "🔊", default = State.ui.sound,
+		callback = function(v) State.ui.sound = v Config.save() end })
+	W.toggle(page, { name = "บันทึกการตั้งค่าอัตโนมัติ", icon = "💾",
+		desc = Config.canFile and ("ไฟล์: " .. Config.fileName) or "executor นี้ใช้ writefile ไม่ได้ (จะจำแค่ในเซสชัน)",
+		default = State.ui.autoSave, callback = function(v) State.ui.autoSave = v if v then Config.save() end end })
+
+	W.section(page, "บันทึก / โหลด")
+	local cbtns = listContainer(page)
+	listButton(cbtns, "บันทึกการตั้งค่า", "💾", function()
+		if Config.save() then HUB.Notify("บันทึกแล้ว", "ok") else HUB.Notify("executor ไม่รองรับ writefile", "warn") end
+	end)
+	listButton(cbtns, "โหลดการตั้งค่า", "📂", function()
+		if Config.load() then HUB.Notify("โหลดแล้ว (บางส่วนต้องเปิดสคริปต์ใหม่)", "ok") else HUB.Notify("ไม่พบไฟล์บันทึก", "warn") end
+	end, nil, Theme.purple, Theme.purpleDark)
+	listButton(cbtns, "จัดหน้าต่างกึ่งกลางจอ", "🎯", function()
+		UI.centerWindow()
+		HUB.Notify("จัดหน้าต่างกึ่งกลางจอแล้ว", "ok")
+	end, nil, Theme.off, Color3.fromRGB(50, 50, 60))
+
+	W.section(page, "Log")
+	local box, text = W.logBox(page, 170)
+	UI.LogText = text
+	UI.refreshLog()
+	local logBtns = listContainer(page)
+	listButton(logBtns, "ล้าง Log", "🧹", function() HUB.LogLines = {} UI.refreshLog() end, nil, Theme.off, Color3.fromRGB(50, 50, 60))
+
+	W.section(page, "อันตราย")
+	local destroyBtn = listButton(cbtns, "ลบสคริปต์ออกจากเกม", "🗑️", nil, nil, Theme.red, Color3.fromRGB(120, 20, 20))
+	local armed = false
+	track(destroyBtn.Activated:Connect(function()
+		if not armed then
+			armed = true
+			destroyBtn.Text = "🗑️  กดอีกครั้งเพื่อยืนยัน"
+			task.delay(3, function()
+				if armed then armed = false destroyBtn.Text = "🗑️  ลบสคริปต์ออกจากเกม" end
+			end)
+		else
+			HUB.Destroy("ผู้ใช้กดลบ")
+		end
+	end))
+
+	W.section(page, "ข้อมูล")
+	W.label(page, string.format(
+		'<font color="#c084ff">🌾 %s v%s</font>\nแพลตฟอร์ม: %s  •  ระบบสัมผัส: %s\nExecutor writefile: %s\nFPS: -',
+		HUB.Name, HUB.Version, HUB.Platform, HUB.IsTouch and "ใช่" or "ไม่ใช่", Config.canFile and "ใช้ได้" or "ไม่ได้"
+	), { bg = Theme.track, height = 74, color = Theme.muted, size = 12 })
+	return page
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  18) INIT
+-- ══════════════════════════════════════════════════════════════
+local function init()
+	local ok, err = pcall(function()
+		Config.load()
+
+		UI.build()
+		if UI.GuiScale then UI.GuiScale.Scale = State.ui.scale or 1 end
+		UI.centerWindow()
+		UI.setAccent(State.ui.accent or "purple")
+		UI.makeDraggable(UI.Window, UI.TopBar)
+		UI.makeLauncherDraggable()
+
+		track(UI.CloseBtn.Activated:Connect(function() UI.setOpen(false) end))
+		track(UI.MinBtn.Activated:Connect(function() UI.setOpen(false) end))
+
+		-- คีย์ลัด (PC / emulator ที่มีคีย์บอร์ด)
+		track(UserInputService.InputBegan:Connect(function(input, gpe)
+			if gpe then return end
+			if input.KeyCode == Enum.KeyCode.RightShift or input.KeyCode == Enum.KeyCode.F1 then
+				UI.setOpen(not UI.Open)
+			elseif input.KeyCode == Enum.KeyCode.RightControl and State.playerMods.fly then
+				Mods.stopFly()
+			end
+		end))
+
+		Mods.wireFlyButtons()
+		Mods.wireInfJump()
+		Mods.applyStats()
+		Mods.statLoop()
+		Mods.autoEquipLoop()
+		ESP.watchPlayers()
+
+		buildFarmTab()
+		buildFishTab()
+		buildRewardTab()
+		buildEspTab()
+		buildTpTab()
+		buildPlayerTab()
+		buildSettingsTab()
+		UI.selectTab("farm")
+
+		Farm.loop()
+		Fish.loop()
+		Rewards.loop()
+		ESP.loop()
+		UI.statusLoop()
+
+		-- กันหน้าต่างหลุดจอเมื่อหมุนจอ/ย่อแอป
+		task.spawn(function()
+			while HUB.Alive and task.wait(2) do
+				pcall(function()
+					camera = Workspace.CurrentCamera or camera
+					if not (UI.Window and UI.Window.Parent) then return end
+					local vp = camera and camera.ViewportSize
+					if not vp then return end
+					local size = UI.Window.AbsoluteSize
+					if size.X > vp.X - 8 or size.Y > vp.Y - 8 then
+						local w, h = UI.windowSize()
+						UI.Window.Size = UDim2.fromOffset(w, h)
+					end
+					UI.clampWindow()
+				end)
+			end
+		end)
+
+		if State.playerMods.fly then task.delay(1.2, function() if HUB.Alive then Mods.startFly() end end) end
+		if State.playerMods.noClip then task.delay(0.5, function() if HUB.Alive then Mods.startNoClip() end end) end
+
+		UI.setOpen(true)
+
+		HUB.Log("โหลด " .. HUB.Name .. " v" .. HUB.Version .. " สำเร็จ  (" .. HUB.Platform .. ")", "ok")
+		HUB.Log("พบ remote: " .. (HUB.Remote("HarvestFruit") and "HarvestFruit ✓" or "HarvestFruit ✗")
+			.. " / " .. (HUB.Remote("Water", 2) and "Water ✓" or "Water ✗")
+			.. " / " .. (HUB.Remote("Fishing", 2) and "Fishing ✓" or "Fishing ✗")
+			.. " / " .. (HUB.Remote("Rebirth", 2) and "Rebirth ✓" or "Rebirth ✗"))
+		local base = World.myBase()
+		HUB.Log("สวนของเรา: " .. (base and base.Name or "ยังไม่พบ (อาจยังไม่ได้รับแปลง)"))
+		HUB.Notify("🌾 " .. HUB.Name .. " พร้อมใช้งาน!", "ok")
+		HUB.Notify("กดปุ่มลอย 🌾 เพื่อเปิด/ปิด  •  ลากแถบหัวเพื่อย้ายหน้าต่าง", "info")
+	end)
+	if not ok then
+		warn("[สวนทุเรียน HUB] โหลดพลาด: " .. tostring(err))
+		HUB.Log("โหลดพลาด: " .. tostring(err), "error")
+	end
+end
+
+init()
+
+return HUB
