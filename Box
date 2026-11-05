@@ -1,0 +1,2041 @@
+--[[==========================================================================
+  AUTO FARM HUB (WindUI) v3 — Anti-Ban + ฝากเงินสุ่ม
+  - ฝากเงิน: สุ่ม 100-500 ที่ ATM (วนจนต่ำกว่าเกณฑ์)
+  - Speed สุ่ม 14-22 / Noclip เฉพาะจุด / Humanizer
+==========================================================================]]
+
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+
+local Players            = game:GetService("Players")
+local TweenService       = game:GetService("TweenService")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService         = game:GetService("RunService")
+local Workspace          = game:GetService("Workspace")
+local RS                 = game:GetService("ReplicatedStorage")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local Remotes   = RS:WaitForChild("Remotes")
+local Send      = Remotes:WaitForChild("Send")
+local RemoteGet = Remotes:WaitForChild("Get")
+
+------------------------------------------------------------
+-- Log
+------------------------------------------------------------
+local logLines = {}
+local function log(s)
+	logLines[#logLines + 1] = os.date("%H:%M:%S ") .. tostring(s)
+	if #logLines > 200 then table.remove(logLines, 1) end
+end
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+local CONFIG = {
+	P1 = Vector3.new(161.06, 255.29, 219.49),
+	P2 = Vector3.new(163.97, 255.32, 203.15),
+	Speed = 18, MinSpeed = 14, MaxSpeed = 22,     -- 🎲 speed สุ่ม
+	ArriveRadius = 3, SegmentLength = 160, StepLen = 8,
+	MaxTries = 10, JumpHeight = 3.5, VisitedRadius = 25,
+	StockTimeout = 12, PickupTimeout = 25,
+	FirstShelfIndex = 2, ResumeDelay = 3,
+	HealThreshold = 50, HealCheckInterval = 0.3,
+	SpamBurst = 3,                                 -- 🎲 ลด prompt spam
+	PullThreshold = 10, BoxMax = 5,
+	DoorStep = 5, StuckTime = 3, UnstickDist = 12,
+	-- 🎲 ระบบฝากเงิน
+	DepositMin = 100,
+	DepositMax = 500,
+}
+local AGENT = { AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 6 }
+local ANGLES = { 0, 20, -20, 40, -40, 70, -70, 100, -100, 140, -140, 180 }
+local DISTS  = { CONFIG.SegmentLength, 80, 40 }
+local LEAD   = 0.05
+
+local S = {
+	running=false, runId=0, auto=false, depositNow=false,
+	antiRagdoll=true, infStamina=true, autoHeal=true,
+	autoRespawn=true, doorKiller=true, toolLock=true, noclipAll=true,
+}
+local UI = { status = "พร้อม", step = "-" }
+local function setStatus(t) UI.status = t end
+local function setStep(t) UI.step = t end
+
+local M = {}
+local hoverH = 3
+local applied = false
+local lastStock, lastNum = 0, nil
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+rayParams.RespectCanCollide = true
+
+local function flatDist(a,b) return Vector3.new(a.X-b.X,0,a.Z-b.Z).Magnitude end
+local function flatUnit(v)
+	local f = Vector3.new(v.X,0,v.Z)
+	if f.Magnitude < 1e-4 then return nil end
+	return f.Unit
+end
+
+local function randSpeed()
+	return CONFIG.MinSpeed + math.random() * (CONFIG.MaxSpeed - CONFIG.MinSpeed)
+end
+
+local function posOf(inst)
+	if inst:IsA("BasePart") then return inst.Position end
+	if inst:IsA("Attachment") then return inst.WorldPosition end
+	if inst:IsA("Model") then
+		local ok,cf = pcall(function() return inst:GetPivot() end)
+		if ok then return cf.Position end
+	end
+	local p = inst:FindFirstAncestorWhichIsA("BasePart")
+	return p and p.Position or nil
+end
+
+local function quick11()
+	local n = Workspace:FindFirstChild("Map")
+	n = n and n:FindFirstChild("Tiles")
+	n = n and n:FindFirstChild("GasStationTile")
+	return n and n:FindFirstChild("Quick11")
+end
+local function getInterior() local q = quick11() return q and q:FindFirstChild("Interior") end
+local function getDoorSystem() local i = getInterior() return i and i:FindFirstChild("DoorSystem") end
+
+local cachedDoorPos, cachedDoors = nil, {}
+local function captureDoorPos()
+	local ds = getDoorSystem()
+	if ds then
+		local list, positions = {}, {}
+		for _,d in ipairs(ds:GetDescendants()) do
+			if d:IsA("BasePart") then
+				positions[#positions+1] = d.Position
+				list[#list+1] = { pos = d.Position, cf = d.CFrame, size = d.Size }
+			end
+		end
+		if #positions > 0 then
+			cachedDoors = list
+			local sum = Vector3.zero
+			for _,p in ipairs(positions) do sum += p end
+			cachedDoorPos = sum / #positions
+			return cachedDoorPos
+		end
+		if ds:IsA("Model") then
+			local ok,cf = pcall(function() return ds:GetPivot() end)
+			if ok and cf then cachedDoorPos = cf.Position return cachedDoorPos end
+		end
+	end
+	return cachedDoorPos
+end
+
+------------------------------------------------------------
+-- Net / Money
+------------------------------------------------------------
+local NetTbl
+local function refreshTbl()
+	pcall(function()
+		local Net = require(RS.Modules.Core.Net)
+		local ups = debug.getupvalues(Net.get)
+		for _,upv in pairs(ups) do
+			if type(upv) == "table" and upv.func ~= nil and upv.event ~= nil then NetTbl = upv return end
+		end
+		for _,upv in pairs(ups) do
+			if type(upv) == "table" and upv.func ~= nil then NetTbl = upv return end
+		end
+	end)
+	if not NetTbl then
+		pcall(function()
+			for _,v in ipairs(getgc(true)) do
+				if typeof(v) == "table" and rawget(v,"event") and rawget(v,"func") then NetTbl = v break end
+			end
+		end)
+	end
+	return NetTbl ~= nil
+end
+refreshTbl()
+
+local function bumpEvent()
+	if not NetTbl then refreshTbl() end
+	if NetTbl and type(NetTbl.event) == "number" then
+		NetTbl.event += 1
+		return NetTbl.event
+	end
+end
+
+local function callGet(action, ...)
+	if not NetTbl then refreshTbl() end
+	if not NetTbl then return false end
+	NetTbl.func = (NetTbl.func or 0) + 1
+	local a = table.pack(...)
+	local ok,res = pcall(function()
+		return RemoteGet:InvokeServer(NetTbl.func, action, table.unpack(a, 1, a.n))
+	end)
+	return ok and res == true
+end
+
+local okData, DataModule = pcall(require, RS.Modules.Core.Data)
+if not okData then DataModule = nil end
+
+local function getMoney()
+	local m = DataModule and DataModule.money
+	if type(m) ~= "table" then return 0, 0 end
+	return tonumber(m.hand) or 0, tonumber(m.bank) or 0
+end
+
+local function fmt(n)
+	n = tonumber(n) or 0
+	local s = tostring(math.floor(n))
+	local out = s:reverse():gsub("(%d%d%d)","%1,"):reverse()
+	return (out:gsub("^,",""))
+end
+
+local function depositAmount(amount)
+	amount = math.floor(tonumber(amount) or 0)
+	if amount <= 0 then return false end
+	if callGet("transfer_funds","hand","bank", amount) then return true end
+	task.wait(0.3)
+	return callGet("transfer_funds","hand","bank", amount)
+end
+
+-- 🎲 ตั้งค่าเงิน
+local Cfg = {
+	AutoOn = false,
+	Threshold = 500,
+	Cooldown = 8,      -- คูลดาวน์ระหว่างรอบฝาก (วิ)
+}
+local totalDeposited, depositCount, lastResult = 0, 0, "—"
+local lastDepositTry = 0
+
+-- 🎲 สุ่มจำนวนที่จะฝาก 1 ครั้ง (คืน 0 ถ้ายังไม่ถึงเกณฑ์)
+local function computeDepositOnce(hand)
+	if hand < Cfg.Threshold then return 0 end
+	local lo = math.min(CONFIG.DepositMin, hand)
+	local hi = math.min(CONFIG.DepositMax, hand)
+	if hi < lo then hi = lo end
+	if hi <= 0 then return 0 end
+	return math.random(lo, hi)
+end
+
+------------------------------------------------------------
+-- ดักรีโมท
+------------------------------------------------------------
+local function onRemote(self, ...)
+	local a1, a2 = ...
+	if typeof(self) == "Instance" and type(a1) == "number" and type(a2) == "string" then
+		lastNum = a1
+		if a2 == "player_stocked_shelf" then lastStock = os.clock() end
+	end
+end
+pcall(function()
+	local old
+	old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		local m = getnamecallmethod()
+		if m == "InvokeServer" or m == "FireServer" then onRemote(self, ...) end
+		return old(self, ...)
+	end))
+end)
+pcall(function()
+	local oldI
+	oldI = hookfunction(RemoteGet.InvokeServer, newcclosure(function(self, ...)
+		onRemote(self, ...)
+		return oldI(self, ...)
+	end))
+end)
+
+------------------------------------------------------------
+-- ประตู / Door Killer
+------------------------------------------------------------
+local function getBasementDoor()
+	local n = Workspace:FindFirstChild("Map")
+	n = n and n:FindFirstChild("Tiles")
+	n = n and n:FindFirstChild("GasStationTile")
+	n = n and n:FindFirstChild("Cellar")
+	return n and n:FindFirstChild("BasementDoor")
+end
+local function killBasementDoor()
+	local bd = getBasementDoor()
+	if bd then pcall(function() bd:Destroy() end) return true end
+	return false
+end
+
+local function isDoorName(name) return name:lower():find("door") ~= nil end
+local killedModules = {}
+local function tryHookDoorModule()
+	pcall(function()
+		local mg = RS:FindFirstChild("Modules") and RS.Modules:FindFirstChild("Game")
+		if not mg then return end
+		local mod = mg:FindFirstChild("DoorSystem") or mg:FindFirstChild("Door")
+			or mg:FindFirstChild("Doors") or mg:FindFirstChild("DoorModule")
+		if not mod or killedModules[mod] then return end
+		local m = require(mod)
+		if type(m) ~= "table" then return end
+		local names = { "lock","close","set_locked","set_open","disable","shut" }
+		for _,fn in ipairs(names) do
+			if type(m[fn]) == "function" then m[fn] = function() end end
+		end
+		for _,v in pairs(m) do
+			if type(v) == "table" then
+				for _,fn in ipairs(names) do
+					if type(v[fn]) == "function" then v[fn] = function() end end
+				end
+			end
+		end
+		killedModules[mod] = true
+	end)
+end
+
+local function killInteriorDoorSystem()
+	local interior = getInterior()
+	local ds = interior and interior:FindFirstChild("DoorSystem")
+	if not ds then return false end
+	for _,v in ipairs(ds:GetDescendants()) do
+		if v:IsA("BasePart") then
+			pcall(function()
+				v.CanCollide = false
+				v.CanTouch = false
+				if v.Transparency < 0.9 then v.Transparency = 1 end
+			end)
+		elseif v:IsA("ProximityPrompt") or v:IsA("ClickDetector") then
+			pcall(function() v:Destroy() end)
+		end
+	end
+	return pcall(function() ds:Destroy() end)
+end
+
+local function disablePart(v)
+	if v:IsA("BasePart") and isDoorName(v.Name) then
+		pcall(function()
+			v.CanCollide = false
+			v.CanTouch = false
+			if v.Transparency < 0.7 then v.Transparency = 0.7 end
+		end)
+		return true
+	end
+	return false
+end
+
+local function sweepShopDoors()
+	local n = 0
+	if killInteriorDoorSystem() then n += 1 end
+	if killBasementDoor() then n += 1 end
+	local q = quick11()
+	if q then
+		for _,v in ipairs(q:GetDescendants()) do
+			if disablePart(v) then n += 1
+			elseif (v:IsA("ProximityPrompt") or v:IsA("Model") or v:IsA("Folder")) and isDoorName(v.Name) then
+				pcall(function() v:Destroy() end)
+			end
+		end
+	end
+	return n
+end
+
+local function destroyDoorModules()
+	for _,v in ipairs(RS:GetDescendants()) do
+		if (v:IsA("ModuleScript") or v:IsA("RemoteEvent") or v:IsA("RemoteFunction")) and isDoorName(v.Name) then
+			pcall(function() v:Destroy() end)
+		end
+	end
+end
+
+local doorThread, doorConn
+local function startDoorKiller()
+	if doorThread then return end
+	tryHookDoorModule()
+	destroyDoorModules()
+	sweepShopDoors()
+	local q = quick11()
+	if q then
+		doorConn = q.DescendantAdded:Connect(function(v)
+			if S.doorKiller then task.defer(disablePart, v) end
+		end)
+	end
+	doorThread = task.spawn(function()
+		while S.doorKiller do
+			pcall(tryHookDoorModule)
+			pcall(killInteriorDoorSystem)
+			pcall(killBasementDoor)
+			task.wait(2)
+		end
+		doorThread = nil
+	end)
+end
+local function stopDoorKiller()
+	S.doorKiller = false
+	if doorConn then doorConn:Disconnect() doorConn = nil end
+end
+
+------------------------------------------------------------
+-- Utilities
+------------------------------------------------------------
+-- 🎲 Anti-ragdoll สุ่ม + เช็คสถานะ
+local antiRagThread
+local function startAntiRagdoll()
+	if antiRagThread then return end
+	if not NetTbl and not refreshTbl() then return end
+	antiRagThread = task.spawn(function()
+		while S.antiRagdoll do
+			local char = player.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			local isRag = hum and (
+				hum:GetState() == Enum.HumanoidStateType.Physics or
+				hum:GetState() == Enum.HumanoidStateType.FallingDown
+			)
+			if isRag then
+				pcall(function()
+					local n = bumpEvent()
+					if n then Send:FireServer(n, "end_ragdoll_early") end
+				end)
+			end
+			task.wait(0.5 + math.random() * 0.9)  -- 🎲 0.5-1.4s
+		end
+		antiRagThread = nil
+	end)
+end
+
+-- 🎲 Inf-stamina เช็คก่อน + สุ่มเวลา
+local infStamThread, origSprintUpdate
+local function getSprintBar()
+	local Sprint = require(RS.Modules.Game.Sprint)
+	return debug.getupvalue(Sprint.consume_stamina, 2).sprint_bar
+end
+local function startInfStamina()
+	if infStamThread then return end
+	pcall(function()
+		local sprintBar = getSprintBar()
+		if sprintBar then
+			origSprintUpdate = sprintBar.update
+			sprintBar.update = function(...) return origSprintUpdate(function() return 1 end) end
+		end
+	end)
+	infStamThread = task.spawn(function()
+		while S.infStamina do
+			pcall(function()
+				local bar = getSprintBar()
+				if bar and bar.s and bar.s < 0.3 then
+					local n = bumpEvent()
+					if n then Send:FireServer(n, "set_sprinting_1", true) end
+				end
+			end)
+			task.wait(0.8 + math.random() * 0.7)  -- 🎲
+		end
+		pcall(function()
+			local sprintBar = getSprintBar()
+			if sprintBar and origSprintUpdate then
+				sprintBar.update = origSprintUpdate
+				origSprintUpdate = nil
+			end
+		end)
+		infStamThread = nil
+	end)
+end
+
+-- Auto-heal
+local healThread
+local function findHealTool()
+	local containers = { player.Character, player:FindFirstChildOfClass("Backpack") }
+	for i = 1, 2 do
+		local c = containers[i]
+		if c then
+			for _,t in ipairs(c:GetChildren()) do
+				if t:IsA("Tool") and t:GetAttribute("HealthRestoreAmount") then return t end
+			end
+		end
+	end
+end
+local function useHealTool(tool)
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (char and hum) then return end
+	local cur = char:FindFirstChildOfClass("Tool")
+	tool.Parent = char
+	task.wait()
+	pcall(function() tool:Activate() end)
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if animator then
+		for _,a in ipairs(animator:GetPlayingAnimationTracks()) do pcall(function() a:Stop(0) end) end
+	end
+	task.wait(0.25)
+	local bp = player:FindFirstChildOfClass("Backpack")
+	if cur and bp and cur.Parent == char then pcall(function() cur.Parent = bp end) end
+end
+local function startAutoHeal()
+	if healThread then return end
+	healThread = task.spawn(function()
+		while S.autoHeal do
+			local char = player.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 and hum.Health < CONFIG.HealThreshold then
+				local tool = findHealTool()
+				if tool then pcall(useHealTool, tool) end
+			end
+			task.wait(CONFIG.HealCheckInterval)
+		end
+		healThread = nil
+	end)
+end
+
+-- Auto-respawn
+local respThread
+local function startAutoRespawn()
+	if respThread then return end
+	if not NetTbl and not refreshTbl() then return end
+	respThread = task.spawn(function()
+		while S.autoRespawn do
+			local char = player.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health <= 0 then
+				task.wait(6)
+				if S.autoRespawn then
+					pcall(function()
+						local n = bumpEvent()
+						if n then Send:FireServer(n, "death_screen_request_respawn") end
+					end)
+				end
+			end
+			task.wait(0.5)
+		end
+		respThread = nil
+	end)
+end
+
+-- Tool lock
+local function lockTool(t)
+	if S.toolLock and t and t:IsA("Tool") then
+		pcall(function() t:SetAttribute("Locked", true) end)
+	end
+end
+local function lockBackpack(bp)
+	if not bp then return end
+	for _,c in ipairs(bp:GetChildren()) do lockTool(c) end
+	bp.ChildAdded:Connect(lockTool)
+end
+lockBackpack(player:FindFirstChildOfClass("Backpack"))
+player.ChildAdded:Connect(function(c) if c:IsA("Backpack") then lockBackpack(c) end end)
+
+------------------------------------------------------------
+-- Humanizer
+------------------------------------------------------------
+local H = {
+	enabled = true,
+	sessionStart = os.clock(),
+	maxSessionMin = 90,
+	restMin = 12, restMax = 22,
+	lastPause = 0, pauseCooldown = 40,
+}
+local function humanPause(force)
+	if not H.enabled then return end
+	if not force and os.clock() - H.lastPause < H.pauseCooldown then return end
+	if math.random() > 0.06 then return end
+	H.lastPause = os.clock()
+	local d = 1.5 + math.random() * 4.5
+	log(("🧍 พักตามคนจริง %.1fs"):format(d))
+	setStep("🧍 พักสายตา")
+	task.wait(d)
+end
+local function sessionCheck()
+	if not H.enabled then return end
+	local mins = (os.clock() - H.sessionStart) / 60
+	if mins >= H.maxSessionMin then
+		local d = H.restMin + math.random() * (H.restMax - H.restMin)
+		log(("😴 ครบ %.0f นาที -> พัก %.0f นาที (กันแบน)"):format(mins, d))
+		setStatus(("😴 พัก %.0f นาที"):format(d))
+		setStep("-")
+		task.wait(d * 60)
+		H.sessionStart = os.clock()
+	end
+end
+
+------------------------------------------------------------
+-- Pathfinder helpers
+------------------------------------------------------------
+CONFIG.Hurdle = true
+CONFIG.MaxHurdle = 20
+CONFIG.AStarNodes = 1200
+S.brute = true
+S.guide = true
+S.unstick = true
+
+local AGENT_PROFILES = {
+	{ r = 2,   h = 5 },
+	{ r = 1.2, h = 5 },
+	{ r = 0.6, h = 4 },
+}
+
+local function groundAt(x,z,refY)
+	local r = Workspace:Raycast(Vector3.new(x, refY+8, z), Vector3.new(0,-40,0), rayParams)
+	return r and r.Position.Y or nil
+end
+local function bodyBlockedAt(a,b,params,rise)
+	local dir = b - a
+	if dir.Magnitude < 0.1 then return false end
+	local flat = flatUnit(dir)
+	local center = a + Vector3.new(0, 2.8 + (rise or 0), 0)
+	local cf = flat and CFrame.lookAt(center, center + flat) or CFrame.new(center)
+	local w = AGENT.AgentRadius * 1.6
+	return Workspace:Blockcast(cf, Vector3.new(w, 3.2, w), dir, params) ~= nil
+end
+local function bodyBlocked(a,b) return bodyBlockedAt(a,b,rayParams,0) end
+local function hurdleRise(a,b)
+	if not CONFIG.Hurdle then return nil end
+	local rise = 2
+	while rise <= CONFIG.MaxHurdle + 1 do
+		if not bodyBlockedAt(a,b,rayParams,rise) then return rise + 1.5 end
+		rise += 1.5
+	end
+end
+local function canSkip(a,b)
+	if bodyBlocked(a,b) then return false end
+	local n = math.floor((b-a).Magnitude / 4)
+	for k = 1, n do
+		local p = a:Lerp(b, k/(n+1))
+		local g = groundAt(p.X,p.Z,p.Y)
+		if not g or math.abs(g - p.Y) > 1.6 then return false end
+	end
+	return true
+end
+
+local function smooth(raw)
+	local out = { raw[1] }
+	local i = 1
+	while i < #raw do
+		local limit = math.min(#raw, i+12)
+		for k = i+1, limit do
+			if raw[k].jump then limit = k break end
+		end
+		local j = i+1
+		for k = limit, i+2, -1 do
+			if canSkip(raw[i].pos, raw[k].pos) then j = k break end
+		end
+		out[#out+1] = raw[j]
+		i = j
+	end
+	return out
+end
+
+local function buildSteps(sm)
+	local steps = {}
+	for i = 2, #sm do
+		local a, b = sm[i-1].pos, sm[i].pos
+		local len = (b-a).Magnitude
+		if sm[i].hop then
+			local rise = sm[i].hop
+			local n = math.max(5, math.ceil(len/3))
+			for k = 1, n do
+				local t = k/n
+				local base = a:Lerp(b, t)
+				local arc = rise * math.sin(math.pi * t)
+				steps[#steps+1] = { pos = Vector3.new(base.X, base.Y + hoverH + arc, base.Z), air = true }
+			end
+		else
+			local n = math.max(1, math.ceil(len / CONFIG.StepLen))
+			local seg = {}
+			for k = 1, n do
+				local p = a:Lerp(b, k/n)
+				local gy = groundAt(p.X,p.Z,p.Y)
+				local y = (gy and math.abs(gy - p.Y) < 3) and gy or p.Y
+				seg[k] = Vector3.new(p.X, y + hoverH, p.Z)
+			end
+			if sm[i].jump then
+				if n == 1 then
+					table.insert(seg, 1, (a+b)/2 + Vector3.new(0, hoverH + CONFIG.JumpHeight, 0))
+				else
+					local mid = math.ceil(n/2)
+					seg[mid] = seg[mid] + Vector3.new(0, CONFIG.JumpHeight, 0)
+				end
+			end
+			for _,p in ipairs(seg) do steps[#steps+1] = { pos = p, air = false } end
+		end
+	end
+	return steps
+end
+
+local function computePathWith(from,to,prof)
+	local path = PathfindingService:CreatePath({
+		AgentRadius = prof.r, AgentHeight = prof.h,
+		AgentCanJump = true, AgentCanClimb = true,
+		WaypointSpacing = AGENT.WaypointSpacing,
+	})
+	local ok = pcall(function() path:ComputeAsync(from, to) end)
+	if ok and path.Status == Enum.PathStatus.Success then return path end
+end
+local function segmentGoal(pos,dir,angle,dist)
+	local d = CFrame.Angles(0, math.rad(angle), 0) * dir
+	local p = pos + d * dist
+	local r = Workspace:Raycast(Vector3.new(p.X, pos.Y+150, p.Z), Vector3.new(0,-600,0), rayParams)
+	if r then return r.Position + Vector3.new(0,1,0) end
+end
+local function nearVisited(p,visited)
+	for _,v in ipairs(visited) do
+		if flatDist(p,v) < CONFIG.VisitedRadius then return true end
+	end
+	return false
+end
+
+local threadRun = setmetatable({}, { __mode = "k" })
+local function alive()
+	local id = threadRun[coroutine.running()]
+	if id and id ~= S.runId then return false end
+	return S.running and S.runId == M.id and M.root and M.root.Parent
+		and M.hum and M.hum.Parent and M.hum.Health > 0
+end
+
+------------------------------------------------------------
+-- Guide (Christmas line)
+------------------------------------------------------------
+local G = { pts = nil, idx = 1, target = nil }
+pcall(function()
+	local o = Workspace:FindFirstChild("XmasGuide")
+	if o then o:Destroy() end
+end)
+local guideFolder = Instance.new("Folder")
+guideFolder.Name = "XmasGuide"
+guideFolder.Parent = Workspace
+
+local GN = 46
+local XRED   = Color3.fromRGB(255,50,65)
+local XGREEN = Color3.fromRGB(40,225,100)
+local XGOLD  = Color3.fromRGB(255,215,90)
+local XWHITE = Color3.fromRGB(245,250,255)
+local bulbPalette = { XRED, XGOLD, XGREEN, XWHITE }
+
+local function mkPart(shape)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.CastShadow = false
+	p.Material = Enum.Material.Neon
+	p.Transparency = 1
+	if shape then p.Shape = shape end
+	p.Parent = guideFolder
+	return p
+end
+
+local segParts, bulbParts = {}, {}
+for i = 1, GN do
+	local sg = mkPart(); sg.Size = Vector3.new(0.32,0.32,1); segParts[i] = sg
+	local bl = mkPart(Enum.PartType.Ball); bl.Size = Vector3.new(1,1,1); bulbParts[i] = bl
+end
+local star = mkPart(Enum.PartType.Ball)
+star.Size = Vector3.new(2.6,2.6,2.6); star.Color = XGOLD
+local starLight = Instance.new("PointLight")
+starLight.Color = XGOLD; starLight.Range = 14; starLight.Brightness = 2.5
+starLight.Enabled = false; starLight.Parent = star
+local snow = Instance.new("ParticleEmitter")
+snow.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+snow.Rate = 28; snow.Lifetime = NumberRange.new(1.2,2)
+snow.Speed = NumberRange.new(2,5); snow.SpreadAngle = Vector2.new(180,180)
+snow.Size = NumberSequence.new(0.5,0); snow.LightEmission = 1
+snow.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, XRED),
+	ColorSequenceKeypoint.new(0.5, XGREEN),
+	ColorSequenceKeypoint.new(1, XWHITE),
+})
+snow.Enabled = false; snow.Parent = star
+
+local guideAcc, guideShown = 0, false
+local function hideGuide()
+	if not guideShown then return end
+	guideShown = false
+	for i = 1, GN do
+		segParts[i].Transparency = 1
+		bulbParts[i].Transparency = 1
+	end
+	star.Transparency = 1
+	snow.Enabled = false
+	starLight.Enabled = false
+end
+
+RunService.Heartbeat:Connect(function(dt)
+	guideAcc += dt
+	if guideAcc < 0.033 then return end
+	guideAcc = 0
+	local pts, root = G.pts, M.root
+	if not (S.guide and S.running and pts and #pts > 0 and root and root.Parent) then
+		hideGuide() return
+	end
+	guideShown = true
+	local t = os.clock()
+	local off = Vector3.new(0, -hoverH + 0.4, 0)
+	local line = { root.Position + off }
+	for k = math.max(G.idx, 1), #pts do
+		line[#line+1] = pts[k] + off
+		if #line > 120 then break end
+	end
+	local SP = 3.4
+	local samples = { line[1] }
+	local need = SP
+	for i = 1, #line-1 do
+		local a,b = line[i], line[i+1]
+		local len = (b-a).Magnitude
+		local pos = 0
+		while len > 0.01 and len - pos >= need and #samples < GN+1 do
+			pos += need
+			samples[#samples+1] = a:Lerp(b, pos/len)
+			need = SP
+		end
+		need -= (len - pos)
+		if #samples >= GN+1 then break end
+	end
+	local ph = math.floor(t*5)
+	local bp = math.floor(t*3)
+	for i = 1, GN do
+		local a,b = samples[i], samples[i+1]
+		local sg, bl = segParts[i], bulbParts[i]
+		if a and b and (b-a).Magnitude > 0.01 then
+			local fade = math.clamp(0.05 + (i/GN)*0.85, 0, 0.95)
+			sg.Size = Vector3.new(0.32,0.32,(b-a).Magnitude + 0.05)
+			sg.CFrame = CFrame.lookAt((a+b)/2, b)
+			sg.Color = ((i + ph) % 2 == 0) and XRED or XGREEN
+			sg.Transparency = fade
+			bl.Color = bulbPalette[((i + bp) % 4) + 1]
+			local pulse = 0.85 + 0.3 * math.sin(t*6 + i)
+			bl.Size = Vector3.new(pulse, pulse, pulse)
+			bl.CFrame = CFrame.new(a + Vector3.new(0, 0.9, 0))
+			bl.Transparency = math.clamp(fade + 0.1, 0, 0.95)
+		else
+			sg.Transparency = 1; bl.Transparency = 1
+		end
+	end
+	local tgt = G.target
+	if tgt then
+		star.Transparency = 0.05
+		snow.Enabled = true; starLight.Enabled = true
+		star.CFrame = CFrame.new(tgt + Vector3.new(0, 4 + math.sin(t*3)*0.5, 0)) * CFrame.Angles(0, t*2, 0)
+	else
+		star.Transparency = 1; snow.Enabled = false; starLight.Enabled = false
+	end
+end)
+
+------------------------------------------------------------
+-- 🎲 Noclip (เฉพาะ Begin/End — ไม่ loop)
+------------------------------------------------------------
+local ncSaved = nil
+local function noclipBegin()
+	if ncSaved or not M.char then return end
+	ncSaved = {}
+	for _,d in ipairs(M.char:GetDescendants()) do
+		if d:IsA("BasePart") then
+			ncSaved[d] = d.CanCollide
+			d.CanCollide = false
+		end
+	end
+end
+local function noclipEnd()
+	if not ncSaved then return end
+	for part, v in pairs(ncSaved) do
+		if part.Parent then part.CanCollide = v end
+	end
+	ncSaved = nil
+end
+
+-- 🎲 tweenTo มี jitter + speed สุ่ม
+local function tweenTo(p, heading)
+	local w0 = os.clock()
+	while M.unstick and alive() and os.clock() - w0 < 8 do task.wait(0.05) end
+	-- jitter ตำแหน่ง (0.2-0.6 studs)
+	local jitter = Vector3.new(
+		(math.random() - 0.5) * 0.6,
+		0,
+		(math.random() - 0.5) * 0.6
+	)
+	local dest = p + jitter
+	local cfv = M.cfv
+	local cur = cfv.Value.Position
+	M.moveDir = heading
+	local spd = randSpeed()
+	M.hum.WalkSpeed = spd
+	local T = math.max((dest - cur).Magnitude / spd, 0.03)
+	T = T * (0.85 + math.random() * 0.3)  -- 🎲 ±15%
+	if M.tween then M.tween:Cancel() end
+	M.tween = TweenService:Create(cfv, TweenInfo.new(T, Enum.EasingStyle.Linear),
+		{ Value = CFrame.lookAt(dest, dest + heading) })
+	M.tween:Play()
+	task.wait(math.max(T - LEAD, 0.01))
+end
+
+local function hopOver(curRoot, pRoot, rise, heading)
+	noclipBegin()
+	local n = math.max(5, math.ceil((pRoot - curRoot).Magnitude / 3))
+	for k = 1, n do
+		if not alive() or M.pulled then break end
+		local t = k / n
+		local base = curRoot:Lerp(pRoot, t)
+		tweenTo(Vector3.new(base.X, base.Y + rise * math.sin(math.pi * t), base.Z), heading)
+	end
+	noclipEnd()
+end
+
+------------------------------------------------------------
+-- A* (เหมือนเดิม)
+------------------------------------------------------------
+local function newHeap()
+	local h, n = {}, 0
+	local function push(f,v)
+		n += 1; h[n] = { f, v }
+		local i = n
+		while i > 1 do
+			local par = math.floor(i/2)
+			if h[par][1] <= h[i][1] then break end
+			h[par], h[i] = h[i], h[par]; i = par
+		end
+	end
+	local function pop()
+		if n == 0 then return nil end
+		local top = h[1]
+		h[1] = h[n]; h[n] = nil; n -= 1
+		local i = 1
+		while true do
+			local l, r, sm = i*2, i*2+1, i
+			if l <= n and h[l][1] < h[sm][1] then sm = l end
+			if r <= n and h[r][1] < h[sm][1] then sm = r end
+			if sm == i then break end
+			h[sm], h[i] = h[i], h[sm]; i = sm
+		end
+		return top[2]
+	end
+	return { push=push, pop=pop, size=function() return n end }
+end
+
+local DIRS8 = { {1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1} }
+
+local function gridAStar(fs, fg)
+	local CELL = 4
+	local ox, oz = fs.X, fs.Z
+	local gx = math.floor((fg.X - ox)/CELL + 0.5)
+	local gz = math.floor((fg.Z - oz)/CELL + 0.5)
+	local limit = math.min(70, math.max(math.abs(gx), math.abs(gz)) + 14)
+	local function key(ix,iz) return (ix+512)*1024 + (iz+512) end
+	local function heur(ix,iz)
+		local dx, dz = math.abs(ix-gx), math.abs(iz-gz)
+		return (math.max(dx,dz) + 0.414*math.min(dx,dz)) * CELL
+	end
+	local nodes = {}
+	local heap = newHeap()
+	local sk = key(0,0)
+	nodes[sk] = { ix=0, iz=0, y=fs.Y, g=0 }
+	heap.push(heur(0,0), sk)
+	local expansions, found = 0, nil
+	while heap.size() > 0 and expansions < CONFIG.AStarNodes do
+		local k = heap.pop()
+		local nd = nodes[k]
+		if not nd.closed then
+			nd.closed = true
+			expansions += 1
+			if expansions % 16 == 0 then
+				task.wait()
+				if not alive() or M.pulled then return nil end
+			end
+			if math.abs(nd.ix-gx) <= 1 and math.abs(nd.iz-gz) <= 1 then found = k break end
+			local a = Vector3.new(ox + nd.ix*CELL, nd.y, oz + nd.iz*CELL)
+			for _,d in ipairs(DIRS8) do
+				local nix, niz = nd.ix + d[1], nd.iz + d[2]
+				if math.abs(nix) <= limit and math.abs(niz) <= limit then
+					local nk = key(nix,niz)
+					local ex = nodes[nk]
+					if not (ex and ex.closed) then
+						local wx, wz = ox + nix*CELL, oz + niz*CELL
+						local gy = groundAt(wx,wz, nd.y - 3)
+						if gy and math.abs(gy - nd.y) <= 3.2 then
+							local b = Vector3.new(wx, gy, wz)
+							local dist = (b-a).Magnitude
+							local cost, hop = dist, nil
+							if bodyBlocked(a,b) then
+								local rise = hurdleRise(a,b)
+								if rise then cost = dist*2.5 + rise*2; hop = rise else cost = nil end
+							end
+							if cost then
+								local ng = nd.g + cost
+								if not ex or ng < ex.g then
+									nodes[nk] = { ix=nix, iz=niz, y=gy, g=ng, parent=k, hop=hop }
+									heap.push(ng + heur(nix,niz), nk)
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	if not found then return nil end
+	local chain, k = {}, found
+	while k do
+		local nd = nodes[k]
+		table.insert(chain, 1, nd)
+		k = nd.parent
+	end
+	local sm = { { pos = fs } }
+	for i = 2, #chain do
+		local nd = chain[i]
+		sm[#sm+1] = { pos = Vector3.new(ox + nd.ix*CELL, nd.y, oz + nd.iz*CELL), hop = nd.hop }
+	end
+	sm[#sm+1] = { pos = fg }
+	return smooth(sm)
+end
+
+local function planRoute(pos, target, visited)
+	local feetStart = Vector3.new(pos.X, pos.Y - hoverH, pos.Z)
+	local snapped = target
+	local gy = groundAt(target.X, target.Z, target.Y)
+	if gy then snapped = Vector3.new(target.X, gy + 1, target.Z) end
+	local function fromPath(path)
+		local wps = path:GetWaypoints()
+		local raw = table.create(#wps)
+		for j,w in ipairs(wps) do
+			raw[j] = { pos = w.Position, jump = (w.Action == Enum.PathWaypointAction.Jump) }
+		end
+		raw[1].pos = feetStart
+		return buildSteps(smooth(raw))
+	end
+	for i,prof in ipairs(AGENT_PROFILES) do
+		local path = computePathWith(pos, snapped, prof)
+		if path then return fromPath(path), (i == 1 and "direct" or ("agent"..i)), path end
+		if not alive() then return nil end
+	end
+	local dir = flatUnit(target - pos) or Vector3.new(0,0,-1)
+	local cands = {}
+	for _,d in ipairs(DISTS) do
+		for _,a in ipairs(ANGLES) do
+			local g = segmentGoal(pos, dir, a, d)
+			if g then
+				local score = flatDist(g, target)
+				if nearVisited(g, visited) then score += 200 end
+				cands[#cands+1] = { g = g, score = score }
+			end
+		end
+	end
+	table.sort(cands, function(x,y) return x.score < y.score end)
+	for i = 1, math.min(#cands, CONFIG.MaxTries) do
+		if not alive() then return nil end
+		local path = computePathWith(pos, cands[i].g, AGENT_PROFILES[2])
+		if path then return fromPath(path), "detour", path end
+	end
+	if CONFIG.Hurdle then
+		local prev = UI.step
+		setStep("🧠 คิดทาง (A*)")
+		local fg = Vector3.new(target.X, gy or feetStart.Y, target.Z)
+		local sm = gridAStar(feetStart, fg)
+		UI.step = prev
+		if sm and #sm >= 2 then return buildSteps(sm), "astar", nil end
+	end
+	return nil
+end
+
+local function walkTo(target, maxFails)
+	maxFails = maxFails or 3
+	local root, cfv = M.root, M.cfv
+	cfv.Value = root.CFrame
+	M.pulled = false
+	local visited, fails = {}, 0
+	local heading = flatUnit(root.CFrame.LookVector) or Vector3.new(0,0,-1)
+	G.target = target
+	while alive() do
+		local pos = cfv.Value.Position
+		if flatDist(pos, target) <= CONFIG.ArriveRadius and math.abs(pos.Y - target.Y) <= 4 then
+			M.moveDir = nil; noclipEnd(); G.pts = nil
+			return true
+		end
+		if not nearVisited(pos, visited) then
+			visited[#visited+1] = pos
+			if #visited > 60 then table.remove(visited, 1) end
+		end
+		local steps, kind, path = planRoute(pos, target, visited)
+		if not alive() then break end
+		if M.pulled then M.pulled = false continue end
+		local blocked, bc = false, nil
+		if path then bc = path.Blocked:Connect(function() blocked = true end) end
+		if not steps or #steps == 0 then
+			fails += 1
+			if bc then bc:Disconnect() end
+			local dy = M.root.Position.Y - target.Y
+			if dy > 8 or fails >= maxFails then
+				M.moveDir = nil; G.pts = nil
+				return false
+			end
+			task.wait(0.4)
+			continue
+		end
+		fails = 0
+		local pts = table.create(#steps)
+		for i,st in ipairs(steps) do pts[i] = st.pos end
+		G.pts, G.idx = pts, 1
+		for idx,st in ipairs(steps) do
+			if M.pulled then M.pulled = false; blocked = true end
+			if not alive() or blocked then break end
+			G.idx = idx
+			local p = st.pos
+			local cur = cfv.Value.Position
+			local dir = flatUnit(p - cur)
+			if dir then heading = dir end
+			local handled = false
+			if not st.air and math.abs(p.Y - cur.Y) < 3 then
+				local fc = Vector3.new(cur.X, cur.Y - hoverH, cur.Z)
+				local fn = Vector3.new(p.X, p.Y - hoverH, p.Z)
+				if bodyBlocked(fc, fn) then
+					local rise = hurdleRise(fc, fn)
+					if rise then
+						hopOver(cur, p, rise, heading)
+						handled = true
+					else
+						blocked = true
+					end
+				end
+			end
+			if blocked then break end
+			if not handled then
+				if st.air then noclipBegin() else noclipEnd() end
+				tweenTo(p, heading)
+			end
+		end
+		noclipEnd()
+		if M.tween and M.tween.PlaybackState == Enum.PlaybackState.Playing and alive() and not blocked then
+			M.tween.Completed:Wait()
+		end
+		if bc then bc:Disconnect() end
+		M.moveDir = nil
+	end
+	noclipEnd()
+	M.moveDir = nil; G.pts = nil
+	return false
+end
+
+local function walkDirect(target)
+	local root, cfv = M.root, M.cfv
+	cfv.Value = root.CFrame
+	local start = cfv.Value.Position
+	local gy = groundAt(target.X, target.Z, target.Y)
+	local goal = gy and Vector3.new(target.X, gy + hoverH, target.Z) or target
+	G.pts, G.idx, G.target = { goal }, 1, goal
+	local n = math.max(1, math.ceil((goal - start).Magnitude / CONFIG.StepLen))
+	local heading = flatUnit(goal - start) or Vector3.new(0,0,-1)
+	for k = 1, n do
+		if not alive() then break end
+		if M.pulled then M.pulled = false break end
+		tweenTo(start:Lerp(goal, k/n), heading)
+	end
+	if M.tween and M.tween.PlaybackState == Enum.PlaybackState.Playing and alive() then
+		M.tween.Completed:Wait()
+	end
+	M.moveDir = nil; G.pts = nil
+	return alive() and flatDist(cfv.Value.Position, goal) <= CONFIG.ArriveRadius + 1
+end
+
+local function walkNoclipOnce(target, keepY)
+	local root, cfv = M.root, M.cfv
+	cfv.Value = root.CFrame
+	M.pulled = false
+	local start = cfv.Value.Position
+	local gy = groundAt(target.X, target.Z, target.Y)
+	local groundY = gy and (gy + hoverH) or nil
+	local goal
+	if keepY and groundY and math.abs(start.Y - groundY) <= 6 then
+		goal = Vector3.new(target.X, start.Y, target.Z)
+	elseif groundY then
+		goal = Vector3.new(target.X, groundY, target.Z)
+	else
+		goal = target
+	end
+	G.pts, G.idx, G.target = { goal }, 1, goal
+	noclipBegin()
+	local n = math.max(1, math.ceil((goal - start).Magnitude / CONFIG.StepLen))
+	local heading = flatUnit(goal - start) or Vector3.new(0,0,-1)
+	for k = 1, n do
+		if not alive() then noclipEnd() G.pts = nil return false end
+		if M.pulled then M.pulled = false noclipEnd() G.pts = nil return false end
+		tweenTo(start:Lerp(goal, k/n), heading)
+	end
+	if M.tween and M.tween.PlaybackState == Enum.PlaybackState.Playing and alive() then
+		M.tween.Completed:Wait()
+	end
+	noclipEnd()
+	M.moveDir = nil; G.pts = nil
+	local p = cfv.Value.Position
+	return alive() and flatDist(p, goal) <= CONFIG.ArriveRadius + 1 and math.abs(p.Y - goal.Y) <= 3
+end
+
+local function travelWrap(fn)
+	return function(...)
+		M.travel = (M.travel or 0) + 1
+		local r = table.pack(pcall(fn, ...))
+		M.travel = math.max((M.travel or 1) - 1, 0)
+		if not r[1] then error(r[2], 0) end
+		return table.unpack(r, 2, r.n)
+	end
+end
+walkTo = travelWrap(walkTo)
+walkDirect = travelWrap(walkDirect)
+walkNoclipOnce = travelWrap(walkNoclipOnce)
+
+local function walkNoclip(target, keepY)
+	for _ = 1, 4 do
+		if walkNoclipOnce(target, keepY) then return true end
+		if not alive() then return false end
+		task.wait(0.15)
+	end
+	return false
+end
+
+local function goTo(target, maxFails, noBrute)
+	local rootY = M.root.Position.Y
+	local tgy = groundAt(target.X, target.Z, target.Y)
+	if tgy and (rootY - (tgy + hoverH)) > 8 then
+		if walkNoclip(target, false) then return true end
+		if not alive() then return false end
+	end
+	for _ = 1, 2 do
+		if not alive() then return false end
+		if walkTo(target, maxFails) then return true end
+		if not alive() then return false end
+		local cur = M.root.Position
+		local gy2 = groundAt(target.X, target.Z, target.Y)
+		if gy2 then
+			local a = Vector3.new(cur.X, cur.Y - hoverH, cur.Z)
+			local b = Vector3.new(target.X, gy2, target.Z)
+			if canSkip(a, b) then
+				if walkDirect(target) then return true end
+			end
+		end
+		task.wait(0.5)
+	end
+	if S.brute and not noBrute and alive() then
+		local tg = groundAt(target.X, target.Z, target.Y)
+		local sameLevel = tg and math.abs(M.root.Position.Y - (tg + hoverH)) <= 3.5
+		return walkNoclip(target, sameLevel and true or false)
+	end
+	return false
+end
+
+local function goToFree(target, maxFails)
+	if S.noclipAll then
+		if walkNoclip(target, true) then return true end
+		if not alive() then return false end
+	end
+	return goTo(target, maxFails)
+end
+
+------------------------------------------------------------
+-- walkViaDoor (ผ่านประตู)
+------------------------------------------------------------
+local function doorNormal(d)
+	local s = d.size
+	local axis
+	if s.X <= s.Y and s.X <= s.Z then axis = d.cf.RightVector
+	elseif s.Z <= s.Y and s.Z <= s.X then axis = d.cf.LookVector end
+	return axis and flatUnit(axis)
+end
+
+local function walkViaDoor(target, maxFails)
+	maxFails = maxFails or 3
+	if not alive() then return false end
+	local tgy = groundAt(target.X, target.Z, target.Y)
+	if tgy and (M.root.Position.Y - (tgy + hoverH)) > 8 then
+		return walkNoclip(target, false)
+	end
+	captureDoorPos()
+	local rp = M.root.Position
+	local best, bs = nil, math.huge
+	for _,d in ipairs(cachedDoors) do
+		if math.max(d.size.X, d.size.Y, d.size.Z) >= 3 then
+			local s = flatDist(rp, d.pos) + flatDist(d.pos, target)
+			if s < bs then best, bs = d, s end
+		end
+	end
+	if best then
+		local flatT = Vector3.new(target.X - best.pos.X, 0, target.Z - best.pos.Z)
+		local n = doorNormal(best) or flatUnit(flatT) or Vector3.new(0,0,1)
+		if flatT:Dot(n) < 0 then n = -n end
+		local playerSide = Vector3.new(rp.X - best.pos.X, 0, rp.Z - best.pos.Z):Dot(n)
+		if playerSide < 2 then
+			setStep("🚪 เดินผ่านประตู")
+			local gy = groundAt(best.pos.X, best.pos.Z, best.pos.Y)
+			local y = gy and (gy + hoverH) or best.pos.Y
+			local mid = Vector3.new(best.pos.X, y, best.pos.Z)
+			local step = CONFIG.DoorStep
+			for _,wp in ipairs({ mid - n*step, mid, mid + n*step }) do
+				if not alive() then return false end
+				if flatDist(M.root.Position, wp) > 2 then
+					if not walkNoclip(wp, true) then
+						if not alive() then return false end
+						goTo(wp, maxFails, false)
+					end
+				end
+			end
+		end
+	elseif cachedDoorPos then
+		local gy = groundAt(cachedDoorPos.X, cachedDoorPos.Z, cachedDoorPos.Y)
+		local wp = gy and Vector3.new(cachedDoorPos.X, gy + hoverH, cachedDoorPos.Z) or cachedDoorPos
+		if flatDist(rp, wp) > 8 and flatDist(rp, target) >= flatDist(rp, wp)*0.8 then
+			setStep("🚪 เดินไปประตู")
+			if not walkNoclip(wp, true) and alive() then goTo(wp, maxFails, false) end
+		end
+	end
+	if not alive() then return false end
+	setStep("📦 ผ่านประตูแล้ว -> Tween ไปโซน")
+	if walkNoclip(target, true) then return true end
+	if not alive() then return false end
+	return goTo(target, maxFails, false)
+end
+
+------------------------------------------------------------
+-- Shop Entry
+------------------------------------------------------------
+local function enterShop()
+	setStep("🚶 ไปหน้าร้าน (P1)")
+	if not goTo(CONFIG.P1, 3) then log("ไป P1 ไม่สำเร็จ") return false end
+	if not alive() then return false end
+	M.moveDir = nil
+	if M.tween then M.tween:Cancel() M.tween = nil end
+	if M.hum and M.hum.Parent then M.hum:Move(Vector3.zero, false) end
+	task.wait(0.1)
+	if not alive() then return false end
+	setStep("📍 Tween ไปจุด P2")
+	if not walkNoclip(CONFIG.P2) then
+		if not alive() then return false end
+		if not goTo(CONFIG.P2, 4) then return false end
+	end
+	if not alive() then return false end
+	return true
+end
+
+------------------------------------------------------------
+-- สมัครงาน
+------------------------------------------------------------
+local function clickApply()
+	local app = playerGui:FindFirstChild("JobApplication")
+	local frame = app and app:FindFirstChild("JobApplicationFrame")
+	local btn = frame and frame:FindFirstChild("ApplyJob")
+	if not (btn and frame.Visible) then return false end
+	if getconnections then
+		for _,c in ipairs(getconnections(btn.Activated)) do pcall(c.Fire, c) end
+		for _,c in ipairs(getconnections(btn.MouseButton1Click)) do pcall(c.Fire, c) end
+	elseif firesignal then
+		pcall(firesignal, btn.Activated)
+		pcall(firesignal, btn.MouseButton1Click)
+	else
+		return false
+	end
+	return true
+end
+local function applyStep()
+	setStep("📝 สมัครงาน")
+	local t0 = os.clock()
+	while alive() and os.clock() - t0 < 15 do
+		if clickApply() then
+			applied = true
+			log("กดปุ่ม ApplyJob แล้ว")
+			task.wait(1.5)
+			return
+		end
+		task.wait(0.7)
+	end
+	if alive() then applied = true log("ถือว่ามีงานแล้ว ไปต่อ") end
+end
+
+------------------------------------------------------------
+-- กล่อง/ชั้นวาง
+------------------------------------------------------------
+local function findBoxTool()
+	local containers = { player.Character, player:FindFirstChildOfClass("Backpack") }
+	for i = 1, 2 do
+		local c = containers[i]
+		if c then
+			for _,t in ipairs(c:GetChildren()) do
+				if t:IsA("Tool") and (t:FindFirstChild("Extra1") or t.Name:lower():find("box")) then return t end
+			end
+		end
+	end
+end
+local function equipBox()
+	local t = findBoxTool()
+	if t and M.hum and t.Parent ~= player.Character then
+		pcall(function() M.hum:EquipTool(t) end)
+	end
+	return t
+end
+local function boxCount(tool)
+	local c = 0
+	for i = 1, CONFIG.BoxMax do
+		local e = tool:FindFirstChild("Extra"..i)
+		if e then
+			local vis = e:IsA("BasePart") and e.Transparency < 1
+			for _,v in ipairs(e:GetChildren()) do
+				if v:IsA("BasePart") and v.Transparency < 1 then vis = true break end
+			end
+			if vis then c = i end
+		end
+	end
+	return c
+end
+local function jobFolder()
+	local i = getInterior()
+	return i and i:FindFirstChild("ShelfStockingJob")
+end
+local function nearestNormalBoxPrompt()
+	local jf = jobFolder()
+	if not jf then return nil end
+	local best, bd = nil, math.huge
+	local rootPos = M.root.Position
+	for _,d in ipairs(jf:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled then
+			local par = d.Parent
+			if par and (par.Name:find("NormalBox") or (par.Parent and par.Parent.Name:find("NormalBox"))) then
+				local p = posOf(par)
+				if p then
+					local dist = (p - rootPos).Magnitude
+					if dist < bd then best, bd = d, dist end
+				end
+			end
+		end
+	end
+	return best, bd
+end
+local function getBoxPickupTarget()
+	local jf = jobFolder()
+	if jf then
+		local best, bd = nil, math.huge
+		local rootPos = M.root and M.root.Position or Vector3.new()
+		for _,d in ipairs(jf:GetDescendants()) do
+			if d:IsA("BasePart") and d.Name:find("NormalBox") then
+				local dist = (d.Position - rootPos).Magnitude
+				if dist < bd then best, bd = d.Position, dist end
+			end
+		end
+		if best then return best end
+		local ok, cf = pcall(function() return jf:GetPivot() end)
+		if ok then return cf.Position end
+	end
+end
+local function pickupBox()
+	setStep("📦 รับกล่อง (กดรัว)")
+	local t0 = os.clock()
+	local lastCount, lastChange = -1, os.clock()
+	while alive() and os.clock() - t0 < CONFIG.PickupTimeout do
+		M.pulled = false
+		local tool = findBoxTool()
+		if tool then
+			local count = boxCount(tool)
+			if count >= CONFIG.BoxMax then break end
+			if count ~= lastCount then lastCount, lastChange = count, os.clock() end
+			if os.clock() - lastChange > 1.5 then break end
+		end
+		local prompt, dist = nearestNormalBoxPrompt()
+		if prompt then
+			if dist and dist > (prompt.MaxActivationDistance or 10) + 2 then
+				local p = posOf(prompt.Parent)
+				if p then goToFree(p, 3) end
+			end
+			if fireproximityprompt then
+				for _ = 1, CONFIG.SpamBurst do
+					pcall(fireproximityprompt, prompt)
+					task.wait(0.06 + math.random() * 0.12)  -- 🎲 สุ่ม
+				end
+			end
+		end
+		task.wait(0.03)
+	end
+	local t = equipBox()
+	if t then log(("ได้กล่อง %s (%d/%d)"):format(t.Name, boxCount(t), CONFIG.BoxMax)) end
+	return t ~= nil
+end
+local function shelfSpots()
+	local spots = {}
+	local jf = jobFolder()
+	if not jf then return spots end
+	local shelves = jf:FindFirstChild("Shelves")
+	if shelves then
+		for i, sh in ipairs(shelves:GetChildren()) do
+			local att = sh:FindFirstChildWhichIsA("Attachment", true)
+			if att then spots[#spots+1] = { idx = i, pos = att.WorldPosition, name = sh.Name } end
+		end
+	end
+	if #spots == 0 then
+		local n = 0
+		for _,d in ipairs(jf:GetDescendants()) do
+			if d:IsA("Attachment") then
+				local par = d.Parent
+				if not (par and par.Name:lower():find("box")) then
+					n += 1
+					spots[#spots+1] = { idx = 100 + n, pos = d.WorldPosition, name = par and par.Name or "Attachment" }
+				end
+			end
+		end
+	end
+	if #spots == 0 then
+		local n = 0
+		for _,d in ipairs(jf:GetDescendants()) do
+			local nm = d.Name:lower()
+			if (nm:find("beacon") or nm:find("ring")) and (d:IsA("BasePart") or d:IsA("Model")) then
+				local p = posOf(d)
+				if p then
+					n += 1
+					spots[#spots+1] = { idx = 200 + n, pos = p, name = d.Name }
+				end
+			end
+		end
+	end
+	table.sort(spots, function(a, b)
+		local ka = a.idx == CONFIG.FirstShelfIndex and 0 or a.idx
+		local kb = b.idx == CONFIG.FirstShelfIndex and 0 or b.idx
+		return ka < kb
+	end)
+	return spots
+end
+local function standUntilStock(timeout, spotPos)
+	local base, t0 = lastStock, os.clock()
+	local tick = 0
+	while alive() and os.clock() - t0 < timeout do
+		if lastStock > base then return true end
+		if M.pulled then
+			M.pulled = false
+			if spotPos and flatDist(M.root.Position, spotPos) > 14 then return false end
+		end
+		if not findBoxTool() then return false end
+		equipBox()
+		tick += 1
+		if tick % 5 == 0 then humanPause() end  -- 🎲
+		task.wait(0.2)
+	end
+	return false
+end
+
+------------------------------------------------------------
+-- ATM + ฝากเงินสุ่ม
+------------------------------------------------------------
+local function getATM()
+	local i = getInterior()
+	return i and i:FindFirstChild("ATM")
+end
+
+-- หา 1 จุดที่ยืนข้าง ATM
+local function findATMSpot()
+	local atm = getATM()
+	if not atm then return nil end
+	local apos = posOf(atm)
+	if not apos then return nil end
+	local rootPos = M.root.Position
+	local feetY = rootPos.Y - hoverH
+	local pts = {}
+	for k = 0, 7 do
+		local a = math.rad(k*45)
+		local x, z = apos.X + math.cos(a)*4, apos.Z + math.sin(a)*4
+		local gy = groundAt(x, z, rootPos.Y)
+		if gy and math.abs(gy - feetY) < 2.5 then
+			local p = Vector3.new(x, gy + hoverH, z)
+			pts[#pts+1] = { pos = p, d = flatDist(p, rootPos) }
+		end
+	end
+	table.sort(pts, function(a,b) return a.d < b.d end)
+	return pts, apos
+end
+
+-- ฝากเงินวนจนกว่าเงินในมือ < เกณฑ์ (สุ่มทีละ 100-500)
+local function depositLoopAtATM()
+	local total = 0
+	local iter = 0
+	local results = {}
+	while alive() and iter < 40 do
+		iter += 1
+		local hand = getMoney()
+		if hand < Cfg.Threshold then break end
+		local amount = computeDepositOnce(hand)
+		if amount <= 0 then break end
+		setStep(("💰 ฝากสุ่ม $%s"):format(fmt(amount)))
+		if depositAmount(amount) then
+			total += amount
+			depositCount += 1
+			results[#results+1] = amount
+			lastResult = ("✅ ฝาก $%s (รวม $%s)"):format(fmt(amount), fmt(total))
+			log(lastResult)
+			-- 🎲 หน่วงระหว่างการฝากแต่ละครั้ง (humanize)
+			task.wait(0.6 + math.random() * 1.0)
+		else
+			lastResult = ("❌ ฝาก $%s ล้มเหลว"):format(fmt(amount))
+			log(lastResult)
+			break
+		end
+	end
+	if total > 0 then
+		totalDeposited += total
+		lastResult = ("✅ ฝากรวม $%s สำเร็จ (%d ครั้ง)"):format(fmt(total), #results)
+		log(lastResult)
+		return true
+	end
+	return false
+end
+
+local function depositAtATM()
+	local atm = getATM()
+	if not atm then
+		lastResult = "❌ ไม่พบ ATM"
+		log(lastResult)
+		return false
+	end
+	local promptOk = false
+	for _,d in ipairs(atm:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled then promptOk = true break end
+	end
+	if not promptOk then
+		lastResult = "❌ ATM ไม่พร้อมใช้งาน"
+		log(lastResult)
+		return false
+	end
+	setStep("🏧 ไปตู้ ATM")
+	local pts, apos = findATMSpot()
+	local reached = false
+	for _,p in ipairs(pts or {}) do
+		if not alive() then return false end
+		if goToFree(p.pos, 3) then reached = true break end
+	end
+	if not reached and apos and alive() then
+		reached = goToFree(apos, 3)
+	end
+	if not reached then
+		lastResult = "❌ ไป ATM ไม่ได้"
+		log(lastResult)
+		return false
+	end
+	task.wait(0.3)
+	-- ฝากวน
+	return depositLoopAtATM()
+end
+
+local function maybeDeposit(force)
+	if not (Cfg.AutoOn or force) then return end
+	local hand = getMoney()
+	if hand < Cfg.Threshold then
+		if force then lastResult = "⚠ ยังไม่ถึงเกณฑ์" end
+		return
+	end
+	if not force and os.clock() - lastDepositTry < Cfg.Cooldown then return end
+	lastDepositTry = os.clock()
+	log(("เงินในมือ $%s ถึงเกณฑ์ -> ไป ATM"):format(fmt(hand)))
+	if not depositAtATM() then
+		lastDepositTry = os.clock() + 10
+	end
+end
+
+local function checkDepositRequests()
+	if S.depositNow then
+		S.depositNow = false
+		maybeDeposit(true)
+	else
+		maybeDeposit(false)
+	end
+end
+
+------------------------------------------------------------
+-- Flow
+------------------------------------------------------------
+local function mainFlow()
+	setStatus("กำลังฟาร์ม")
+	if flatDist(M.root.Position, CONFIG.P2) <= 8 then
+		-- skip enter
+	else
+		if not enterShop() then return "❌ เข้า Shop ไม่สำเร็จ" end
+	end
+	if not alive() then return end
+	if applied then
+		-- skip
+	else
+		if flatDist(M.root.Position, CONFIG.P2) > 6 then
+			setStep("🚶 ไปจุดสมัครงาน (P2)")
+			goToFree(CONFIG.P2, 3)
+		end
+		if not alive() then return end
+		applyStep()
+	end
+	if not alive() then return end
+
+	local failStreak, noSpotTicks = 0, 0
+	while alive() do
+		sessionCheck()  -- 🎲
+		checkDepositRequests()
+		if not alive() then return end
+		if not findBoxTool() then
+			setStep("🚶 ไปโซนรับกล่อง")
+			local boxTarget = getBoxPickupTarget()
+			local success = false
+			if boxTarget then
+				success = walkViaDoor(boxTarget, 3)
+			else
+				local interior = getInterior()
+				if interior then
+					local ok, cf = pcall(function() return interior:GetPivot() end)
+					if ok then success = walkViaDoor(cf.Position, 3) end
+				end
+			end
+			if success then
+				failStreak = 0
+				if not pickupBox() then
+					log("รับกล่องไม่สำเร็จ ลองใหม่")
+					task.wait(1)
+				end
+			else
+				failStreak += 1
+				task.wait(2)
+				if failStreak >= 2 then
+					failStreak = 0
+					enterShop()
+				end
+			end
+		else
+			equipBox()
+			local spots = shelfSpots()
+			if #spots == 0 then
+				noSpotTicks += 1
+				task.wait(2)
+			else
+				noSpotTicks = 0
+				for _, sp in ipairs(spots) do
+					if not alive() or not findBoxTool() then break end
+					equipBox()
+					humanPause()  -- 🎲
+					setStep(("🗄 ไปชั้น #%d (%s)"):format(sp.idx, sp.name))
+					if goTo(sp.pos, 3, true) then
+						setStep(("⏳ ยืนรอวางกล่อง ชั้น #%d"):format(sp.idx))
+						local ok = standUntilStock(CONFIG.StockTimeout, sp.pos)
+						log(ok and ("✅ วางกล่องแล้ว ชั้น #%d"):format(sp.idx)
+							or ("หมดเวลา ที่ชั้น #%d"):format(sp.idx))
+					end
+					task.wait(0.4)
+					checkDepositRequests()
+				end
+			end
+		end
+		task.wait(0.2)
+	end
+end
+
+local function depositOnlyFlow()
+	setStatus("ฝากเงิน")
+	maybeDeposit(true)
+	return "เสร็จ"
+end
+
+------------------------------------------------------------
+-- Start / Stop
+------------------------------------------------------------
+local function cleanupMover()
+	noclipEnd()
+	G.pts = nil
+	if M.tween then M.tween:Cancel() end
+	if M.conn then M.conn:Disconnect() end
+	if M.watch then M.watch:Disconnect() M.watch = nil end
+	pcall(function() RunService:UnbindFromRenderStep("AutoFarmMove") end)
+	M.moveDir = nil
+	if M.hum and M.hum.Parent then
+		M.hum:Move(Vector3.zero, false)
+		if M.prevSpeed then M.hum.WalkSpeed = M.prevSpeed end
+	end
+	if M.root and M.root.Parent then
+		M.root.AssemblyLinearVelocity = Vector3.zero
+		M.root.AssemblyAngularVelocity = Vector3.zero
+	end
+	if M.cfv then M.cfv:Destroy() end
+	M.cfv, M.conn, M.tween = nil, nil, nil
+end
+local function stopRun(msg)
+	if not S.running and not M.cfv then return end
+	S.running = false
+	S.runId += 1
+	cleanupMover()
+	setStatus(msg or "หยุดแล้ว")
+	setStep("-")
+end
+
+local function startStuckWatchdog(myId)
+	task.spawn(function()
+		local lastPos, lastMove = nil, os.clock()
+		local strikes, lastStrike = 0, 0
+		while S.running and S.runId == myId do
+			task.wait(0.25)
+			local root, cfv, hum = M.root, M.cfv, M.hum
+			if not (S.unstick and root and root.Parent and cfv and hum and hum.Health > 0) then
+				lastPos, lastMove = nil, os.clock()
+				continue
+			end
+			local now = os.clock()
+			local pos = root.Position
+			local travelling = (M.travel or 0) > 0 and not M.unstick
+			if not travelling or not lastPos or (pos - lastPos).Magnitude > 1.5 then
+				lastPos, lastMove = pos, now
+			elseif now - lastMove >= CONFIG.StuckTime then
+				local goal = G.target
+				local flat = goal and flatUnit(goal - pos) or nil
+				if not flat then flat = flatUnit(root.CFrame.LookVector) or Vector3.new(0,0,-1) end
+				strikes = (now - lastStrike < 15) and (strikes + 1) or 1
+				lastStrike = now
+				local dist = CONFIG.UnstickDist * strikes
+				if goal then dist = math.min(dist, math.max(flatDist(pos, goal), 3)) end
+				local dest = pos + flat * dist
+				local gy = groundAt(dest.X, dest.Z, pos.Y)
+				local y = (gy and math.abs(gy + hoverH - pos.Y) <= 6) and (gy + hoverH) or pos.Y
+				dest = Vector3.new(dest.X, y, dest.Z)
+				log(("🛟 ติด %d วิ -> Tween %.0f studs"):format(CONFIG.StuckTime, dist))
+				M.unstick = true
+				M.pulled = true
+				if M.tween then M.tween:Cancel() end
+				cfv.Value = root.CFrame
+				noclipBegin()
+				local T = math.max((dest - pos).Magnitude / math.max(CONFIG.Speed, 24), 0.15)
+				local tw = TweenService:Create(cfv, TweenInfo.new(T, Enum.EasingStyle.Linear),
+					{ Value = CFrame.lookAt(dest, dest + flat) })
+				M.tween = tw
+				tw:Play()
+				tw.Completed:Wait()
+				noclipEnd()
+				M.unstick = false
+				M.pulled = true
+				lastPos, lastMove = root.Position, os.clock()
+			end
+		end
+	end)
+end
+
+local function startRun(flow)
+	if S.running then return end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then setStatus("❌ ไม่พบตัวละคร") return end
+	if hum.SeatPart then setStatus("❌ ลงจากที่นั่งก่อน") return end
+	S.running = true
+	S.runId += 1
+	M = { char = char, hum = hum, root = root, id = S.runId, prevSpeed = hum.WalkSpeed }
+	hum.Died:Connect(function() applied = false end)
+	local ignore = { char }
+	for _,pl in ipairs(Players:GetPlayers()) do
+		if pl.Character and pl.Character ~= char then table.insert(ignore, pl.Character) end
+	end
+	rayParams.FilterDescendantsInstances = ignore
+	local pos0 = root.Position
+	local g0 = Workspace:Raycast(pos0 + Vector3.new(0,3,0), Vector3.new(0,-300,0), rayParams)
+	hoverH = g0 and math.clamp(pos0.Y - g0.Position.Y, 1.5, 6)
+		or math.clamp(hum.HipHeight + root.Size.Y/2, 1.5, 6)
+	local cfv = Instance.new("CFrameValue")
+	cfv.Value = root.CFrame
+	M.cfv = cfv
+	M.conn = cfv.Changed:Connect(function(v)
+		if root.Parent then
+			root.CFrame = v
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end
+	end)
+	M.lastPullLog = 0
+	M.watch = RunService.Heartbeat:Connect(function()
+		if not alive() or not M.cfv then return end
+		if os.clock() < (M.ignoreUntil or 0) then return end
+		local d = (root.Position - M.cfv.Value.Position).Magnitude
+		if d > CONFIG.PullThreshold then
+			M.pulled = true
+			if M.tween then M.tween:Cancel() end
+			M.moveDir = nil
+			M.cfv.Value = root.CFrame
+			if os.clock() - M.lastPullLog > 2 then
+				M.lastPullLog = os.clock()
+				log(("โดนดึง %d studs -> คิดใหม่"):format(d))
+			end
+		end
+	end)
+	RunService:BindToRenderStep("AutoFarmMove", Enum.RenderPriority.Input.Value + 1, function()
+		if M.moveDir and hum.Parent then hum:Move(M.moveDir, false) end
+	end)
+	local myId = S.runId
+	startStuckWatchdog(myId)
+	task.spawn(function()
+		threadRun[coroutine.running()] = myId
+		local ok, res = pcall(flow)
+		if not ok then log("error: " .. tostring(res)) end
+		if S.runId == myId then
+			stopRun(ok and (res or "จบการทำงาน") or "❌ error (ดู Log)")
+		end
+	end)
+end
+
+player.CharacterAdded:Connect(function(char)
+	applied = false
+	if S.running then stopRun("เกิดใหม่") end
+	if S.auto then
+		char:WaitForChild("HumanoidRootPart", 10)
+		task.wait(CONFIG.ResumeDelay)
+		if S.auto and not S.running then startRun(mainFlow) end
+	end
+end)
+
+------------------------------------------------------------
+-- UI
+------------------------------------------------------------
+local Window = WindUI:CreateWindow({
+	Title = "🎄 AUTO FARM HUB",
+	Author = "Farm • ATM Random Deposit",
+	Icon = "bot",
+	Folder = "AutoFarmHub",
+	Theme = "Dark",
+	Size = UDim2.fromOffset(500, 460),
+})
+local FarmTab = Window:Tab({ Title = "ฟาร์ม", Icon = "play" })
+local DepTab  = Window:Tab({ Title = "ฝากเงิน", Icon = "banknote" })
+
+local function makeLive(tab, title, initial)
+	local obj
+	pcall(function() obj = tab:Paragraph({ Title = title, Desc = initial }) end)
+	if obj and obj.SetDesc then
+		return function(text) pcall(obj.SetDesc, obj, text) end
+	end
+	return function() end
+end
+
+-- ฟาร์ม
+local setFStatus = makeLive(FarmTab, "📊 สถานะ", "พร้อม")
+local setFStep   = makeLive(FarmTab, "🧭 ขั้นตอน", "-")
+FarmTab:Divider()
+FarmTab:Toggle({
+	Title = "▶ เริ่มฟาร์มอัตโนมัติ",
+	Desc = "P1 -> P2 -> รับงาน -> รับกล่อง -> วางชั้น วนไป",
+	Value = false,
+	Callback = function(v)
+		if v then S.auto = true startRun(mainFlow)
+		else S.auto = false stopRun("หยุดแล้ว") end
+	end,
+})
+FarmTab:Slider({
+	Title = "ความเร็วสูงสุด (studs/s) — สุ่มจริง 14 ถึงค่านี้",
+	Step = 1,
+	Value = { Min = 14, Max = 40, Default = CONFIG.MaxSpeed },
+	Callback = function(v)
+		CONFIG.MaxSpeed = v
+		if CONFIG.Speed > v then CONFIG.Speed = v end
+	end,
+})
+FarmTab:Toggle({ Title="ทะลุกำแพงในร้าน (Tween ตรง)", Value=true, Callback=function(v) S.noclipAll=v end })
+FarmTab:Toggle({ Title="🎄 เส้นนำทางคริสต์มาส", Value=true, Callback=function(v) S.guide=v end })
+FarmTab:Toggle({ Title="🦘 Tween ข้ามรั้ว + A*", Value=true, Callback=function(v) CONFIG.Hurdle=v end })
+FarmTab:Toggle({ Title="💥 หาทางไม่ได้ -> Tween ทะลุตรง", Value=true, Callback=function(v) S.brute=v end })
+FarmTab:Toggle({ Title="🛟 ปลดล็อกอัตโนมัติ", Value=true, Callback=function(v) S.unstick=v end })
+
+-- ฝากเงิน
+local setHand = makeLive(DepTab, "💵 เงินในมือ", "$0")
+local setBank = makeLive(DepTab, "🏧 ATM (Bank)", "$0")
+local setDStatus = makeLive(DepTab, "📌 สถานะฝาก", "—")
+DepTab:Divider()
+
+DepTab:Toggle({
+	Title = "🔄 ฝากเงินอัตโนมัติ",
+	Desc = "เมื่อเงินในมือถึงเกณฑ์ -> ไป ATM -> สุ่มฝาก 100-500 วนจนต่ำกว่าเกณฑ์",
+	Value = false,
+	Callback = function(v)
+		Cfg.AutoOn = v
+		lastDepositTry = 0
+		lastResult = v and "🟢 เปิดระบบ" or "⏸ ปิดระบบ"
+	end,
+})
+DepTab:Input({
+	Title = "💵 เกณฑ์เงินในมือ ($) — เริ่มฝากเมื่อถึงค่านี้",
+	Value = tostring(Cfg.Threshold),
+	Placeholder = "500",
+	Callback = function(text)
+		local n = tonumber(text)
+		if n and n > 0 then
+			Cfg.Threshold = math.floor(n)
+			if CONFIG.DepositMax > Cfg.Threshold then
+				CONFIG.DepositMax = Cfg.Threshold
+			end
+			lastDepositTry = 0
+		end
+	end,
+})
+DepTab:Input({
+	Title = "🎲 สุ่มฝาก ต่ำสุด ($)",
+	Value = tostring(CONFIG.DepositMin),
+	Placeholder = "100",
+	Callback = function(text)
+		local n = tonumber(text)
+		if n and n >= 1 then
+			CONFIG.DepositMin = math.floor(n)
+			if CONFIG.DepositMax < CONFIG.DepositMin then
+				CONFIG.DepositMax = CONFIG.DepositMin
+			end
+		end
+	end,
+})
+DepTab:Input({
+	Title = "🎲 สุ่มฝาก สูงสุด ($)",
+	Value = tostring(CONFIG.DepositMax),
+	Placeholder = "500",
+	Callback = function(text)
+		local n = tonumber(text)
+		if n and n >= 1 then
+			CONFIG.DepositMax = math.floor(n)
+			if CONFIG.DepositMin > CONFIG.DepositMax then
+				CONFIG.DepositMin = CONFIG.DepositMax
+			end
+		end
+	end,
+})
+DepTab:Slider({
+	Title = "⏱ คูลดาวน์ระหว่างรอบฝาก (วินาที)",
+	Step = 1,
+	Value = { Min = 1, Max = 60, Default = Cfg.Cooldown },
+	Callback = function(v) Cfg.Cooldown = v end,
+})
+DepTab:Space()
+DepTab:Button({
+	Title = "🏧 ไปฝากเดี๋ยวนี้ (ตามเกณฑ์)",
+	Callback = function()
+		if S.running then
+			S.depositNow = true
+			lastResult = "⏳ จะฝากหลังจบขั้นตอนปัจจุบัน"
+		else
+			startRun(depositOnlyFlow)
+		end
+	end,
+})
+
+------------------------------------------------------------
+-- UI update loop
+------------------------------------------------------------
+task.spawn(function()
+	local last = {}
+	local function push(key, setter, value)
+		if last[key] ~= value then last[key] = value setter(value) end
+	end
+	while true do
+		task.wait(1.0 + math.random() * 0.8)  -- 🎲 poll สุ่ม
+		local hand, bank = getMoney()
+		push("hand", setHand, ("$%s"):format(fmt(hand)))
+		push("bank", setBank, ("$%s"):format(fmt(bank)))
+		push("dres", setDStatus, lastResult)
+		push("fs", setFStatus, UI.status)
+		push("fst", setFStep, UI.step)
+	end
+end)
+
+------------------------------------------------------------
+-- Bootstrap
+------------------------------------------------------------
+S.doorKiller = true
+task.spawn(function()
+	task.wait(1)
+	startAntiRagdoll()
+	startInfStamina()
+	startAutoHeal()
+	startAutoRespawn()
+end)
+task.spawn(function()
+	for _ = 1, 20 do
+		if captureDoorPos() then break end
+		task.wait(0.3)
+	end
+	task.wait(0.5)
+	startDoorKiller()
+end)
+task.spawn(function()
+	task.wait(2)
+	log(getATM() and "🏧 พบ ATM" or "⚠️ ไม่พบ ATM")
+	log("Net counter: " .. (NetTbl and "OK" or "FAIL"))
+	log(("🎲 ฝากสุ่ม %d-%d (เกณฑ์ %d)"):format(CONFIG.DepositMin, CONFIG.DepositMax, Cfg.Threshold))
+end)
+log("พร้อมแล้ว — เปิดสวิตช์ในแท็บฟาร์ม/ฝากเงิน")
